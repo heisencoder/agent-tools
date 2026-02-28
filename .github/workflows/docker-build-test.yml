@@ -87,6 +87,26 @@ jobs:
             exit 1
           fi
 
+      - name: Verify agents work with runtime bind mounts
+        run: |
+          # run-agent.sh mounts host dirs over /home/agent/.local/share and
+          # /home/agent/.claude at runtime.  Make sure the agents are still
+          # reachable on $PATH when those mounts are in place.
+          mkdir -p /tmp/share-mount /tmp/claude-mount /tmp/config-mount
+          podman run --rm \
+            -v /tmp/test-project:/workspace \
+            -v /tmp/config-mount:/home/agent/.config \
+            -v /tmp/share-mount:/home/agent/.local/share \
+            -v /tmp/claude-mount:/home/agent/.claude \
+            agent-sandbox claude --version
+          podman run --rm \
+            -v /tmp/test-project:/workspace \
+            -v /tmp/config-mount:/home/agent/.config \
+            -v /tmp/share-mount:/home/agent/.local/share \
+            -v /tmp/claude-mount:/home/agent/.claude \
+            agent-sandbox codex --version
+          echo "Agents are reachable with runtime bind mounts"
+
       - name: Test Python venv creation
         run: |
           podman run --rm agent-sandbox python3 -m venv /tmp/testvenv
