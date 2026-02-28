@@ -2,12 +2,12 @@ name: Build and Test Container Image
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
     paths:
       - 'agent-sandbox/**'
       - '.github/workflows/docker-build-test.yml'
   pull_request:
-    branches: [main, master]
+    branches: [main]
     paths:
       - 'agent-sandbox/**'
       - '.github/workflows/docker-build-test.yml'
@@ -71,8 +71,8 @@ jobs:
         run: |
           SHELL_PATH=$(podman run --rm agent-sandbox sh -c 'echo $SHELL')
           echo "Default shell: $SHELL_PATH"
-          if [ "$SHELL_PATH" != "/bin/zsh" ]; then
-            echo "ERROR: Default shell should be /bin/zsh, not '$SHELL_PATH'"
+          if [ "$SHELL_PATH" != "/bin/bash" ]; then
+            echo "ERROR: Default shell should be /bin/bash, not '$SHELL_PATH'"
             exit 1
           fi
 

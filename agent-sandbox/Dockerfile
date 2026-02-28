@@ -1,14 +1,13 @@
 # Secure Coding Agent Container
 #
 # A hardened container image for running coding agents (Claude Code, OpenAI Codex,
-# etc.) with multi-client data compartmentalization. Designed for rootless Podman
-# on Ubuntu, providing strong isolation between client projects.
+# etc.) in rootless Podman on Ubuntu.
 #
 # Build:
 #   podman build -t agent-sandbox agent-sandbox/
 #
 # Run via helper script:
-#   ./agent-sandbox/run-agent.sh --client acme --agent claude /path/to/project
+#   ./agent-sandbox/run-agent.sh --agent claude /path/to/project
 
 FROM ubuntu:24.04
 
@@ -21,7 +20,7 @@ ENV TZ="$TZ"
 # -------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl wget ca-certificates gnupg \
-    zsh less vim nano jq fzf unzip man-db procps \
+    less vim jq fzf unzip man-db procps \
     build-essential pkg-config libssl-dev \
     iproute2 \
     python3 python3-pip python3-venv \
@@ -57,7 +56,7 @@ RUN mkdir -p /etc/apt/keyrings \
 RUN userdel -r ubuntu 2>/dev/null || true \
     && groupdel ubuntu 2>/dev/null || true \
     && groupadd --gid 1000 agent \
-    && useradd --uid 1000 --gid 1000 -m -s /bin/zsh agent \
+    && useradd --uid 1000 --gid 1000 -m -s /bin/bash agent \
     && mkdir -p /home/agent/.claude /home/agent/.local/share/npm-global \
     && chown -R agent:agent /home/agent
 
@@ -70,9 +69,9 @@ WORKDIR /workspace
 ENV HOME=/home/agent
 ENV NPM_CONFIG_PREFIX=/home/agent/.local/share/npm-global
 ENV PATH="$PATH:/home/agent/.local/share/npm-global/bin:/home/agent/.local/bin"
-ENV SHELL=/bin/zsh
-ENV EDITOR=nano
-ENV VISUAL=nano
+ENV SHELL=/bin/bash
+ENV EDITOR=vim
+ENV VISUAL=vim
 
 # -------------------------------------------------------------------
 # 6. Install coding agents
@@ -87,7 +86,7 @@ RUN npm install -g @openai/codex@latest
 # 7. Container metadata
 # -------------------------------------------------------------------
 LABEL org.opencontainers.image.title="agent-sandbox" \
-      org.opencontainers.image.description="Secure container for running coding agents with client data isolation" \
+      org.opencontainers.image.description="Secure container for running coding agents with rootless isolation" \
       org.opencontainers.image.source="https://github.com/heisencoder/agent-tools"
 
-CMD ["/bin/zsh"]
+CMD ["/bin/bash"]

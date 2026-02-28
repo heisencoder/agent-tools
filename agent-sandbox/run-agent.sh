@@ -220,7 +220,7 @@ case "$AGENT" in
         CONTAINER_CMD=("codex" "--full-auto")
         ;;
     shell)
-        CONTAINER_CMD=("/bin/zsh")
+        CONTAINER_CMD=("/bin/bash")
         ;;
     *)
         echo "Unknown agent: $AGENT (expected: claude, codex, or shell)" >&2
