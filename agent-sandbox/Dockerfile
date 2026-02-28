@@ -16,11 +16,14 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG TZ=UTC
 ENV TZ="$TZ"
 
+# Use bash with pipefail so pipe failures are caught
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # -------------------------------------------------------------------
 # 1. Install system packages: dev tools, networking, security
 # -------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl wget ca-certificates gnupg2 sudo \
+    git curl wget ca-certificates gnupg sudo \
     zsh less vim nano jq fzf unzip man-db procps \
     build-essential pkg-config libssl-dev \
     iptables ipset iproute2 dnsutils \
@@ -42,11 +45,12 @@ RUN mkdir -p /etc/apt/keyrings \
 # -------------------------------------------------------------------
 # 3. Install GitHub CLI
 # -------------------------------------------------------------------
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-    | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-    > /etc/apt/sources.list.d/github-cli.list \
+RUN mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
