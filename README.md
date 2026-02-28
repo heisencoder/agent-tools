@@ -7,15 +7,11 @@ Tools for securely running AI coding agents in isolated environments.
 ### [agent-sandbox](agent-sandbox/)
 
 A Podman container and launcher script for running coding agents (Claude Code,
-OpenAI Codex) with per-client data compartmentalization. Designed for
-consultants and developers who work across multiple client projects and need
-strong isolation guarantees.
+OpenAI Codex) in rootless containers on Linux.
 
 **Key features:**
 
 - **Rootless Podman containers** with user-namespace isolation
-- **Per-client data directories** — each client gets isolated agent config,
-  conversation history, and workspace
 - **Claude Code support** via API key or OAuth login (mount your host
   `~/.claude` into the container)
 - **OpenAI Codex support** via API key
@@ -29,13 +25,12 @@ strong isolation guarantees.
 # Build the container image
 podman build -t agent-sandbox agent-sandbox/
 
-# Run Claude Code for a client project (API key)
+# Run Claude Code with an API key
 export ANTHROPIC_API_KEY="sk-ant-..."
-./agent-sandbox/run-agent.sh --client acme --agent claude ./projects/acme-webapp
+./agent-sandbox/run-agent.sh ./projects/webapp
 
 # Run Claude Code using your existing OAuth login
-./agent-sandbox/run-agent.sh --client acme --agent claude \
-    --claude-config ~/.claude ./projects/acme-webapp
+./agent-sandbox/run-agent.sh --claude-config ~/.claude ./projects/webapp
 ```
 
 See the [agent-sandbox README](agent-sandbox/README.md) for full documentation.

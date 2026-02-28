@@ -1,20 +1,19 @@
 # agent-sandbox
 
 Secure Podman container for running coding agents (Claude Code, OpenAI Codex)
-with per-client data compartmentalization on Ubuntu.
+with rootless isolation on Linux.
 
 ## Overview
 
-When working with AI coding agents across multiple client projects, you need
-strong isolation guarantees — one client's code and credentials must never leak
-to another. This package provides:
-
 - **Rootless Podman containers** — no daemon, no root, user-namespace isolation
-- **Per-client data directories** — each client gets its own agent config,
-  conversation history, and workspace
+- **Persistent agent state** — config and conversation history survive across
+  sessions
 - **Minimal attack surface** — capabilities dropped, `no-new-privileges` enforced
 - **Network isolation** — full network disable via `--no-network`
 - **Multi-agent support** — run Claude Code, OpenAI Codex, or a plain shell
+
+For multi-client isolation, create separate Linux users and run the script as
+each user — each gets their own home directory and container state automatically.
 
 ## Quick Start
 
@@ -33,25 +32,25 @@ podman build -t agent-sandbox agent-sandbox/
 ### Run an agent
 
 ```bash
-# Claude Code for client "acme" (API key)
+# Claude Code with an API key
 export ANTHROPIC_API_KEY="sk-ant-..."
-./agent-sandbox/run-agent.sh --client acme --agent claude ./projects/acme-webapp
+./agent-sandbox/run-agent.sh --agent claude ./projects/webapp
 
-# Claude Code for client "acme" (OAuth — share your host login)
-./agent-sandbox/run-agent.sh --client acme --agent claude --claude-config ~/.claude ./projects/acme-webapp
+# Claude Code with OAuth (share your host login)
+./agent-sandbox/run-agent.sh --claude-config ~/.claude ./projects/webapp
 
-# OpenAI Codex for client "globex"
+# OpenAI Codex
 export OPENAI_API_KEY="sk-..."
-./agent-sandbox/run-agent.sh --client globex --agent codex ./projects/globex-api
+./agent-sandbox/run-agent.sh --agent codex ./projects/api
 
 # Just a shell for exploration
-./agent-sandbox/run-agent.sh --client personal --agent shell
+./agent-sandbox/run-agent.sh --agent shell
 ```
 
 ### Resume a session
 
 ```bash
-./agent-sandbox/run-agent.sh --client acme --resume
+./agent-sandbox/run-agent.sh --resume
 ```
 
 ## Authentication
@@ -65,11 +64,8 @@ passed into the container automatically:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
-./agent-sandbox/run-agent.sh --client acme --agent claude ./project
+./agent-sandbox/run-agent.sh ./project
 ```
-
-Each client gets an isolated `~/.claude` directory inside the container, so
-conversation history and settings are fully compartmentalized.
 
 ### Option 2: OAuth Login (no API key)
 
@@ -77,8 +73,7 @@ If you have logged into Claude Code on your host machine (`claude login`),
 you can share that session with the container using `--claude-config`:
 
 ```bash
-./agent-sandbox/run-agent.sh --client acme --agent claude \
-    --claude-config ~/.claude ./project
+./agent-sandbox/run-agent.sh --claude-config ~/.claude ./project
 ```
 
 This bind-mounts your host `~/.claude` directory (which contains
@@ -91,32 +86,18 @@ is set, and `~/.claude/.credentials.json` exists on the host, the script
 automatically mounts `~/.claude` **read-only** so your OAuth tokens are
 available without any extra flags.
 
-## Data Compartmentalization
+## Persistent Data
 
-Each client's data is stored separately under `~/.local/share/agent-sandbox/`:
+Agent state is stored under `~/.local/share/agent-sandbox/`:
 
 ```
 ~/.local/share/agent-sandbox/
-└── clients/
-    ├── acme/
-    │   ├── claude/      # Claude config and conversation history
-    │   ├── codex/       # Codex session data
-    │   ├── config/      # Agent configuration
-    │   └── history/     # Shell and command history
-    └── globex/
-        ├── claude/
-        ├── codex/
-        ├── config/
-        └── history/
+├── claude/      # Claude Code config and conversation history
+├── config/      # Agent configuration
+└── history/     # Shell and command history
 ```
 
 Only the designated project directory is mounted read-write in the container.
-Client A's container has zero access to Client B's data or project files.
-
-> **Note:** When using `--claude-config`, the host's `~/.claude` replaces the
-> per-client `claude/` directory. This shares your OAuth session across clients
-> but also means conversation history is shared. If you need fully isolated
-> history per client, use API key authentication instead.
 
 ## Security Features
 
@@ -127,7 +108,7 @@ Client A's container has zero access to Client B's data or project files.
 | User namespaces | Container `root` maps to your unprivileged UID |
 | Capability drop | `--cap-drop=ALL` with minimal re-adds |
 | No new privileges | Prevents privilege escalation inside the container |
-| Bind mounts | Only project dir (rw) and client config (rw) are mounted |
+| Bind mounts | Only project dir (rw) and agent state (rw) are mounted |
 | SELinux labels | `:Z` relabeling for proper MAC enforcement |
 
 ### Network isolation
@@ -135,7 +116,7 @@ Client A's container has zero access to Client B's data or project files.
 Disable networking entirely with `--no-network`:
 
 ```bash
-./agent-sandbox/run-agent.sh --client acme --agent claude --no-network ./project
+./agent-sandbox/run-agent.sh --no-network ./project
 ```
 
 This passes `--network=none` to Podman, completely preventing the container
@@ -144,17 +125,14 @@ from making any network connections.
 ## run-agent.sh Reference
 
 ```
-Usage: run-agent.sh --client <name> [OPTIONS] [project-dir]
-
-Required:
-  --client <name>        Client/project identifier for data compartmentalization
+Usage: run-agent.sh [OPTIONS] [project-dir]
 
 Options:
   --agent <name>         Agent to run: claude (default), codex, or shell
   --claude-config <dir>  Mount a Claude config directory into the container
                          (use to share OAuth login from the host)
   --image <image>        Container image (default: agent-sandbox:latest)
-  --resume               Reattach to an existing container for this client
+  --resume               Reattach to an existing container
   --no-network           Disable all container networking
   --mount <host:cont>    Additional bind mount (read-only)
   --mount-rw <host:cont> Additional bind mount (read-write)
@@ -162,7 +140,7 @@ Options:
   --help                 Show this help message
 
 Environment variables:
-  AGENT_SANDBOX_DATA     Base dir for per-client state
+  AGENT_SANDBOX_DATA     Base dir for persistent agent state
                          (default: ~/.local/share/agent-sandbox)
   ANTHROPIC_API_KEY      API key for Claude Code
   OPENAI_API_KEY         API key for OpenAI Codex
