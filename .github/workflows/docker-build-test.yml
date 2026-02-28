@@ -113,6 +113,10 @@ jobs:
 
       # -----------------------------------------------------------
       # Persistent home tests (simulates run-agent.sh mount layout)
+      #
+      # These tests use --userns=keep-id:uid=1000,gid=1000 just like
+      # run-agent.sh, so the CI runner's UID maps to the container's
+      # "agent" user (UID 1000) and can write to the mounted volume.
       # -----------------------------------------------------------
       - name: Entrypoint populates persistent home on first run
         run: |
@@ -120,6 +124,7 @@ jobs:
           # copy /home/agent.skel contents into it and create .home-initialized.
           mkdir -p /tmp/persistent-home
           podman run --rm \
+            --userns=keep-id:uid=1000,gid=1000 \
             -v /tmp/persistent-home:/home/agent \
             agent-sandbox test -f /home/agent/.home-initialized
           echo ".home-initialized marker created"
@@ -141,6 +146,7 @@ jobs:
           # entrypoint does NOT overwrite it (i.e. it skips the cp).
           echo "canary" > /tmp/persistent-home/.canary
           podman run --rm \
+            --userns=keep-id:uid=1000,gid=1000 \
             -v /tmp/persistent-home:/home/agent \
             agent-sandbox cat /home/agent/.canary | grep -q canary
           echo "Entrypoint correctly skipped re-initialization"
@@ -150,10 +156,12 @@ jobs:
           # run-agent.sh mounts $DATA_HOME/home over /home/agent.
           # Verify agents are reachable after entrypoint initialization.
           podman run --rm \
+            --userns=keep-id:uid=1000,gid=1000 \
             -v /tmp/persistent-home:/home/agent \
             -v /tmp/test-project:/workspace \
             agent-sandbox claude --version
           podman run --rm \
+            --userns=keep-id:uid=1000,gid=1000 \
             -v /tmp/persistent-home:/home/agent \
             -v /tmp/test-project:/workspace \
             agent-sandbox codex --version
@@ -164,11 +172,13 @@ jobs:
           # Install a file into the persistent home, then verify it
           # survives in a second container with the same volume.
           podman run --rm \
+            --userns=keep-id:uid=1000,gid=1000 \
             -v /tmp/persistent-home:/home/agent \
             agent-sandbox sh -c 'mkdir -p ~/.local/bin && echo "#!/bin/sh" > ~/.local/bin/my-tool && chmod +x ~/.local/bin/my-tool'
 
           # Second container: verify the file persists
           podman run --rm \
+            --userns=keep-id:uid=1000,gid=1000 \
             -v /tmp/persistent-home:/home/agent \
             agent-sandbox test -x /home/agent/.local/bin/my-tool
           echo "Runtime installs persist across container restarts"
@@ -183,6 +193,7 @@ jobs:
           echo "github.com:" > /tmp/gh-config/hosts.yml
 
           HOSTS=$(podman run --rm \
+            --userns=keep-id:uid=1000,gid=1000 \
             -v /tmp/persistent-home:/home/agent \
             -v /tmp/gh-config:/home/agent/.config/gh:ro \
             agent-sandbox cat /home/agent/.config/gh/hosts.yml)
@@ -194,6 +205,7 @@ jobs:
 
           echo -e "[user]\n\tname = Test Agent" > /tmp/test-gitconfig
           GIT_USER=$(podman run --rm \
+            --userns=keep-id:uid=1000,gid=1000 \
             -v /tmp/persistent-home:/home/agent \
             -v /tmp/test-gitconfig:/home/agent/.gitconfig:ro \
             agent-sandbox git config user.name)
