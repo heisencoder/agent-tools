@@ -75,12 +75,7 @@ ENV EDITOR=vim
 ENV VISUAL=vim
 
 # -------------------------------------------------------------------
-# 6. Install Rust toolchain (stable)
-# -------------------------------------------------------------------
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-
-# -------------------------------------------------------------------
-# 7. Install coding agents
+# 6. Install coding agents
 # -------------------------------------------------------------------
 # Claude Code
 RUN npm install -g @anthropic-ai/claude-code@latest
@@ -89,10 +84,12 @@ RUN npm install -g @anthropic-ai/claude-code@latest
 RUN npm install -g @openai/codex@latest
 
 # -------------------------------------------------------------------
-# 8. Save home directory template for persistent-home initialization.
+# 7. Save home directory template for persistent-home initialization.
 #    When run-agent.sh mounts a persistent volume over /home/agent,
 #    the entrypoint copies this template into the empty volume once,
-#    so tools installed during the image build survive restarts.
+#    so tools installed during the image build (npm packages, etc.)
+#    are available immediately.  Tools installed at runtime (e.g.
+#    rustup, pip packages) persist in the volume across restarts.
 # -------------------------------------------------------------------
 USER root
 RUN cp -a /home/agent /home/agent.skel
@@ -100,7 +97,7 @@ COPY --chmod=755 entrypoint.sh /usr/local/bin/entrypoint.sh
 USER agent
 
 # -------------------------------------------------------------------
-# 9. Container metadata
+# 8. Container metadata
 # -------------------------------------------------------------------
 LABEL org.opencontainers.image.title="agent-sandbox" \
       org.opencontainers.image.description="Secure container for running coding agents with rootless isolation" \

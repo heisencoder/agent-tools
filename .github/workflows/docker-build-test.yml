@@ -25,6 +25,9 @@ jobs:
       - name: Build container image with Podman
         run: podman build --layers -t agent-sandbox agent-sandbox/
 
+      # -----------------------------------------------------------
+      # Image content tests (no persistent volume)
+      # -----------------------------------------------------------
       - name: Verify basic system tools
         run: |
           echo "--- Node.js ---"
@@ -41,6 +44,10 @@ jobs:
           podman run --rm agent-sandbox jq --version
           echo "--- GitHub CLI ---"
           podman run --rm agent-sandbox gh --version
+          echo "--- clang ---"
+          podman run --rm agent-sandbox clang --version | head -1
+          echo "--- lld ---"
+          podman run --rm agent-sandbox ld.lld --version
 
       - name: Verify coding agents are installed
         run: |
@@ -76,6 +83,23 @@ jobs:
             exit 1
           fi
 
+      - name: Verify cargo/bin is on PATH
+        run: |
+          # ~/.cargo/bin must be on PATH so that a runtime "rustup" install
+          # makes rustc/cargo available immediately without PATH changes.
+          PATH_VAL=$(podman run --rm agent-sandbox sh -c 'echo $PATH')
+          echo "PATH: $PATH_VAL"
+          if ! echo "$PATH_VAL" | grep -q '/home/agent/.cargo/bin'; then
+            echo "ERROR: ~/.cargo/bin is not on PATH"
+            exit 1
+          fi
+
+      - name: Verify home skel template exists
+        run: |
+          # The entrypoint copies /home/agent.skel into persistent volumes.
+          podman run --rm agent-sandbox test -d /home/agent.skel/.npm-global
+          echo "/home/agent.skel exists and contains .npm-global"
+
       - name: Test bind mount capability
         run: |
           mkdir -p /tmp/test-project
@@ -87,37 +111,79 @@ jobs:
             exit 1
           fi
 
-      - name: Verify agents work with runtime bind mounts
+      # -----------------------------------------------------------
+      # Persistent home tests (simulates run-agent.sh mount layout)
+      # -----------------------------------------------------------
+      - name: Entrypoint populates persistent home on first run
         run: |
-          # run-agent.sh mounts host dirs over /home/agent/.local/share and
-          # /home/agent/.claude at runtime.  Make sure the agents are still
-          # reachable on $PATH when those mounts are in place.
-          mkdir -p /tmp/share-mount /tmp/claude-mount /tmp/config-mount
+          # Mount an empty directory as /home/agent.  The entrypoint should
+          # copy /home/agent.skel contents into it and create .home-initialized.
+          mkdir -p /tmp/persistent-home
           podman run --rm \
+            -v /tmp/persistent-home:/home/agent \
+            agent-sandbox test -f /home/agent/.home-initialized
+          echo ".home-initialized marker created"
+
+          # Verify key directories were copied from the skel
+          for d in .npm-global .claude; do
+            if [ ! -d "/tmp/persistent-home/$d" ]; then
+              echo "ERROR: $d was not copied into persistent home"
+              exit 1
+            fi
+            echo "  $d: present"
+          done
+          echo "Persistent home populated correctly"
+
+      - name: Entrypoint skips initialization on subsequent runs
+        run: |
+          # The persistent home from the previous step already has
+          # .home-initialized.  Drop a canary file and verify the
+          # entrypoint does NOT overwrite it (i.e. it skips the cp).
+          echo "canary" > /tmp/persistent-home/.canary
+          podman run --rm \
+            -v /tmp/persistent-home:/home/agent \
+            agent-sandbox cat /home/agent/.canary | grep -q canary
+          echo "Entrypoint correctly skipped re-initialization"
+
+      - name: Agents work with persistent home mount
+        run: |
+          # run-agent.sh mounts $DATA_HOME/home over /home/agent.
+          # Verify agents are reachable after entrypoint initialization.
+          podman run --rm \
+            -v /tmp/persistent-home:/home/agent \
             -v /tmp/test-project:/workspace \
-            -v /tmp/config-mount:/home/agent/.config \
-            -v /tmp/share-mount:/home/agent/.local/share \
-            -v /tmp/claude-mount:/home/agent/.claude \
             agent-sandbox claude --version
           podman run --rm \
+            -v /tmp/persistent-home:/home/agent \
             -v /tmp/test-project:/workspace \
-            -v /tmp/config-mount:/home/agent/.config \
-            -v /tmp/share-mount:/home/agent/.local/share \
-            -v /tmp/claude-mount:/home/agent/.claude \
             agent-sandbox codex --version
-          echo "Agents are reachable with runtime bind mounts"
+          echo "Agents are reachable with persistent home mount"
 
-      - name: Verify gh and git configs survive runtime mounts
+      - name: Runtime installs persist across container restarts
         run: |
-          # Simulate the gh config overlay that run-agent.sh performs:
-          # .config is mounted from the data dir, but ~/.config/gh is
-          # overlaid from the host.  Verify the file is visible at the
-          # expected path despite the broader .config mount.
+          # Install a file into the persistent home, then verify it
+          # survives in a second container with the same volume.
+          podman run --rm \
+            -v /tmp/persistent-home:/home/agent \
+            agent-sandbox sh -c 'mkdir -p ~/.local/bin && echo "#!/bin/sh" > ~/.local/bin/my-tool && chmod +x ~/.local/bin/my-tool'
+
+          # Second container: verify the file persists
+          podman run --rm \
+            -v /tmp/persistent-home:/home/agent \
+            agent-sandbox test -x /home/agent/.local/bin/my-tool
+          echo "Runtime installs persist across container restarts"
+
+      - name: Verify gh and git config overlays on persistent home
+        run: |
+          # Simulate the mount layout from run-agent.sh:
+          #   /home/agent        ← persistent home volume
+          #   ~/.config/gh       ← overlaid from host
+          #   ~/.gitconfig       ← overlaid from host
           mkdir -p /tmp/gh-config
           echo "github.com:" > /tmp/gh-config/hosts.yml
+
           HOSTS=$(podman run --rm \
-            -v /tmp/test-project:/workspace \
-            -v /tmp/config-mount:/home/agent/.config \
+            -v /tmp/persistent-home:/home/agent \
             -v /tmp/gh-config:/home/agent/.config/gh:ro \
             agent-sandbox cat /home/agent/.config/gh/hosts.yml)
           echo "hosts.yml content: $HOSTS"
@@ -126,9 +192,9 @@ jobs:
             exit 1
           fi
 
-          # Verify .gitconfig mount works
           echo -e "[user]\n\tname = Test Agent" > /tmp/test-gitconfig
           GIT_USER=$(podman run --rm \
+            -v /tmp/persistent-home:/home/agent \
             -v /tmp/test-gitconfig:/home/agent/.gitconfig:ro \
             agent-sandbox git config user.name)
           echo "git user.name: $GIT_USER"
