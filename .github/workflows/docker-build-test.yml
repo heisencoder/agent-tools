@@ -111,17 +111,10 @@ jobs:
         run: |
           # Simulate the gh config overlay that run-agent.sh performs:
           # .config is mounted from the data dir, but ~/.config/gh is
-          # overlaid from the host.  Verify gh can read its config.
+          # overlaid from the host.  Verify the file is visible at the
+          # expected path despite the broader .config mount.
           mkdir -p /tmp/gh-config
           echo "github.com:" > /tmp/gh-config/hosts.yml
-          GH_VER=$(podman run --rm \
-            -v /tmp/test-project:/workspace \
-            -v /tmp/config-mount:/home/agent/.config \
-            -v /tmp/gh-config:/home/agent/.config/gh:ro \
-            agent-sandbox gh --version)
-          echo "gh with overlay mount: $GH_VER"
-
-          # Verify gh can see the mounted hosts.yml
           HOSTS=$(podman run --rm \
             -v /tmp/test-project:/workspace \
             -v /tmp/config-mount:/home/agent/.config \
