@@ -195,7 +195,7 @@ PODMAN_ARGS=(
 # Determine how to mount ~/.claude:
 #   1. Explicit --claude-config: mount that directory (read-write)
 #   2. No --claude-config, no ANTHROPIC_API_KEY, but ~/.claude/.credentials.json
-#      exists: auto-mount ~/.claude read-only for OAuth
+#      exists: auto-mount host's ~/.claude (read-write, shared)
 #   3. Otherwise: mount the data dir's claude/ subdir
 
 if [ -n "$CLAUDE_CONFIG" ]; then
@@ -208,17 +208,10 @@ if [ -n "$CLAUDE_CONFIG" ]; then
         PODMAN_ARGS+=(-v "$CLAUDE_JSON:/home/agent/.claude.json:Z")
     fi
 elif [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
-    echo "Claude config:   auto-detected OAuth (credentials read-only)"
-    # Use the persistent data directory for writable state (history,
-    # project trust, debug logs, etc.) and overlay just the host's
-    # credentials file read-only.  Mounting the entire ~/.claude as ro
-    # (the previous approach) prevented Claude Code from writing any
-    # state after the trust prompt, causing it to freeze.
-    PODMAN_ARGS+=(-v "$DATA_HOME/claude:/home/agent/.claude:Z")
-    touch "$DATA_HOME/claude/.credentials.json"
-    PODMAN_ARGS+=(-v "$HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")
+    echo "Claude config:   auto-detected OAuth ($HOME/.claude shared)"
+    PODMAN_ARGS+=(-v "$HOME/.claude:/home/agent/.claude:Z")
     if [ -f "$HOME/.claude.json" ]; then
-        PODMAN_ARGS+=(-v "$HOME/.claude.json:/home/agent/.claude.json:ro")
+        PODMAN_ARGS+=(-v "$HOME/.claude.json:/home/agent/.claude.json:Z")
     fi
 else
     PODMAN_ARGS+=(-v "$DATA_HOME/claude:/home/agent/.claude:Z")
@@ -228,22 +221,18 @@ fi
 # GitHub credentials (gh CLI + git)
 # -----------------------------------------------------------------
 # Mount gh CLI config if available on the host.  This directory
-# contains hosts.yml with OAuth / PAT tokens.  Mounted read-only so
-# the container can authenticate but cannot alter the host's tokens.
-# Note: this is layered on top of the broader .config mount, so
-# /home/agent/.config/gh comes from the host while the rest of
-# .config is the persistent data directory.
+# contains hosts.yml with OAuth / PAT tokens.
 if [ -d "$HOME/.config/gh" ]; then
-    echo "GitHub CLI:      $HOME/.config/gh (read-only)"
-    PODMAN_ARGS+=(-v "$HOME/.config/gh:/home/agent/.config/gh:ro")
+    echo "GitHub CLI:      $HOME/.config/gh (shared)"
+    PODMAN_ARGS+=(-v "$HOME/.config/gh:/home/agent/.config/gh:Z")
 fi
 
 # Mount the user's .gitconfig if it exists (provides git identity,
 # aliases, and credential-helper settings such as
 # "credential.helper = !gh auth git-credential").
 if [ -f "$HOME/.gitconfig" ]; then
-    echo "Git config:      $HOME/.gitconfig (read-only)"
-    PODMAN_ARGS+=(-v "$HOME/.gitconfig:/home/agent/.gitconfig:ro")
+    echo "Git config:      $HOME/.gitconfig (shared)"
+    PODMAN_ARGS+=(-v "$HOME/.gitconfig:/home/agent/.gitconfig:Z")
 fi
 
 # Network isolation
