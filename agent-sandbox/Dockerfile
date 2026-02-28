@@ -57,7 +57,9 @@ RUN mkdir -p /etc/apt/keyrings \
 # -------------------------------------------------------------------
 # 4. Create non-root 'agent' user for rootless Podman compatibility
 # -------------------------------------------------------------------
-RUN groupadd --gid 1000 agent \
+RUN userdel -r ubuntu 2>/dev/null || true \
+    && groupdel ubuntu 2>/dev/null || true \
+    && groupadd --gid 1000 agent \
     && useradd --uid 1000 --gid 1000 -m -s /bin/zsh agent \
     && mkdir -p /home/agent/.claude /home/agent/.local/share/npm-global \
     && chown -R agent:agent /home/agent

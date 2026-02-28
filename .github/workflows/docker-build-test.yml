@@ -19,8 +19,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check Podman version
+        run: podman --version
+
       - name: Build container image with Podman
-        run: podman build --progress=plain -t agent-sandbox agent-sandbox/
+        run: podman build --layers -t agent-sandbox agent-sandbox/
 
       - name: Verify basic system tools
         run: |
