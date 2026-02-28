@@ -19,8 +19,8 @@ each user — each gets their own home directory and container state automatical
 
 ### Prerequisites
 
-- Ubuntu 22.04+ (or any Linux with Podman)
-- [Podman](https://podman.io/getting-started/installation) (rootless mode)
+- Ubuntu 24.04+ (or any Linux with Podman 4.9+)
+- [Podman](https://podman.io/getting-started/installation) 4.9+ (rootless mode)
 - An Anthropic API key **or** an existing Claude Code OAuth login
 
 ### Build the image
@@ -126,7 +126,7 @@ Only the designated project directory is mounted read-write in the container.
 
 | Layer | Protection |
 |-------|-----------|
-| User namespaces | Container `root` maps to your unprivileged UID |
+| User namespaces | Host UID/GID mapped to container's `agent` user (1000:1000) |
 | Capability drop | `--cap-drop=ALL` with minimal re-adds |
 | No new privileges | Prevents privilege escalation inside the container |
 | Bind mounts | Only project dir (rw) and agent state (rw) are mounted |

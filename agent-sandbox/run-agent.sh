@@ -156,7 +156,12 @@ PODMAN_ARGS=(
     --name "$CONTAINER_NAME"
     --rm
     -it
-    --userns=keep-id
+    # Map the host caller's UID/GID to the container's "agent" user
+    # (UID 1000, GID 1000).  Without the :uid/gid suffix, --userns=keep-id
+    # maps the host UID as-is, which fails when it doesn't match 1000
+    # (e.g. "groups: cannot find name for group ID 1002").
+    # Requires Podman >= 4.3.
+    --userns=keep-id:uid=1000,gid=1000
     # Mount the project directory (read-write)
     -v "$PROJECT_DIR:/workspace:Z"
     # Mount persistent config and history
