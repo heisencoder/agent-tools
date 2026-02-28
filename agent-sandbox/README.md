@@ -86,6 +86,27 @@ is set, and `~/.claude/.credentials.json` exists on the host, the script
 automatically mounts `~/.claude` **read-only** so your OAuth tokens are
 available without any extra flags.
 
+### GitHub CLI & Git Credentials
+
+The script auto-detects and mounts GitHub credentials so that `gh` and
+`git` work inside the container without extra configuration.
+
+**Auto-mounted (read-only) when present on the host:**
+
+| Host path | Container path | Purpose |
+|-----------|---------------|---------|
+| `~/.config/gh/` | `/home/agent/.config/gh/` | `gh` CLI auth tokens (`hosts.yml`) |
+| `~/.gitconfig` | `/home/agent/.gitconfig` | Git identity and credential helpers |
+
+**Environment variables (passed through if set):**
+
+- `GH_TOKEN` — GitHub personal access token (used by `gh` CLI)
+- `GITHUB_TOKEN` — Alternative GitHub token variable
+
+If your `.gitconfig` uses `gh` as a credential helper
+(`credential.helper = !gh auth git-credential`), git operations against
+GitHub will authenticate automatically through the mounted `gh` config.
+
 ## Persistent Data
 
 Agent state is stored under `~/.local/share/agent-sandbox/`:
@@ -144,6 +165,8 @@ Environment variables:
                          (default: ~/.local/share/agent-sandbox)
   ANTHROPIC_API_KEY      API key for Claude Code
   OPENAI_API_KEY         API key for OpenAI Codex
+  GH_TOKEN               GitHub personal access token (gh CLI)
+  GITHUB_TOKEN           GitHub token (alternative to GH_TOKEN)
 ```
 
 ## Development

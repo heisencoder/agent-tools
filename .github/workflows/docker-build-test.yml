@@ -107,6 +107,43 @@ jobs:
             agent-sandbox codex --version
           echo "Agents are reachable with runtime bind mounts"
 
+      - name: Verify gh and git configs survive runtime mounts
+        run: |
+          # Simulate the gh config overlay that run-agent.sh performs:
+          # .config is mounted from the data dir, but ~/.config/gh is
+          # overlaid from the host.  Verify gh can read its config.
+          mkdir -p /tmp/gh-config
+          echo "github.com:" > /tmp/gh-config/hosts.yml
+          GH_VER=$(podman run --rm \
+            -v /tmp/test-project:/workspace \
+            -v /tmp/config-mount:/home/agent/.config \
+            -v /tmp/gh-config:/home/agent/.config/gh:ro \
+            agent-sandbox gh --version)
+          echo "gh with overlay mount: $GH_VER"
+
+          # Verify gh can see the mounted hosts.yml
+          HOSTS=$(podman run --rm \
+            -v /tmp/test-project:/workspace \
+            -v /tmp/config-mount:/home/agent/.config \
+            -v /tmp/gh-config:/home/agent/.config/gh:ro \
+            agent-sandbox cat /home/agent/.config/gh/hosts.yml)
+          echo "hosts.yml content: $HOSTS"
+          if [ "$HOSTS" != "github.com:" ]; then
+            echo "ERROR: gh config overlay mount failed"
+            exit 1
+          fi
+
+          # Verify .gitconfig mount works
+          echo -e "[user]\n\tname = Test Agent" > /tmp/test-gitconfig
+          GIT_USER=$(podman run --rm \
+            -v /tmp/test-gitconfig:/home/agent/.gitconfig:ro \
+            agent-sandbox git config user.name)
+          echo "git user.name: $GIT_USER"
+          if [ "$GIT_USER" != "Test Agent" ]; then
+            echo "ERROR: .gitconfig mount failed"
+            exit 1
+          fi
+
       - name: Test Python venv creation
         run: |
           podman run --rm agent-sandbox python3 -m venv /tmp/testvenv

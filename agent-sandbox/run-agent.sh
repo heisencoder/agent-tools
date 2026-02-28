@@ -76,11 +76,23 @@ Authentication:
   and ~/.claude/.credentials.json exists, the script will automatically
   mount ~/.claude read-only for OAuth support.
 
+GitHub:
+  If ~/.config/gh exists on the host, it is bind-mounted read-only into
+  the container so that 'gh' commands authenticate automatically.
+
+  If ~/.gitconfig exists, it is also mounted read-only so that git
+  picks up your identity (user.name, user.email) and credential helpers.
+
+  You can also set GH_TOKEN or GITHUB_TOKEN in your environment — these
+  are passed into the container automatically.
+
 Environment variables:
   AGENT_SANDBOX_DATA    Base directory for persistent agent state
                         (default: ~/.local/share/agent-sandbox)
   ANTHROPIC_API_KEY     API key for Claude Code
   OPENAI_API_KEY        API key for OpenAI Codex
+  GH_TOKEN              GitHub personal access token (used by gh CLI)
+  GITHUB_TOKEN          GitHub token (alternative to GH_TOKEN)
 EOF
     exit 0
 }
@@ -190,17 +202,45 @@ else
     PODMAN_ARGS+=(-v "$DATA_HOME/claude:/home/agent/.claude:Z")
 fi
 
+# -----------------------------------------------------------------
+# GitHub credentials (gh CLI + git)
+# -----------------------------------------------------------------
+# Mount gh CLI config if available on the host.  This directory
+# contains hosts.yml with OAuth / PAT tokens.  Mounted read-only so
+# the container can authenticate but cannot alter the host's tokens.
+# Note: this is layered on top of the broader .config mount, so
+# /home/agent/.config/gh comes from the host while the rest of
+# .config is the persistent data directory.
+if [ -d "$HOME/.config/gh" ]; then
+    echo "GitHub CLI:      $HOME/.config/gh (read-only)"
+    PODMAN_ARGS+=(-v "$HOME/.config/gh:/home/agent/.config/gh:ro")
+fi
+
+# Mount the user's .gitconfig if it exists (provides git identity,
+# aliases, and credential-helper settings such as
+# "credential.helper = !gh auth git-credential").
+if [ -f "$HOME/.gitconfig" ]; then
+    echo "Git config:      $HOME/.gitconfig (read-only)"
+    PODMAN_ARGS+=(-v "$HOME/.gitconfig:/home/agent/.gitconfig:ro")
+fi
+
 # Network isolation
 if [ "$NO_NETWORK" = true ]; then
     PODMAN_ARGS+=(--network=none)
 fi
 
-# Pass API keys via environment (if set on the host)
+# Pass API keys / tokens via environment (if set on the host)
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     PODMAN_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
 fi
 if [ -n "${OPENAI_API_KEY:-}" ]; then
     PODMAN_ARGS+=(-e "OPENAI_API_KEY=$OPENAI_API_KEY")
+fi
+if [ -n "${GH_TOKEN:-}" ]; then
+    PODMAN_ARGS+=(-e "GH_TOKEN=$GH_TOKEN")
+fi
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    PODMAN_ARGS+=(-e "GITHUB_TOKEN=$GITHUB_TOKEN")
 fi
 
 # Extra mounts
