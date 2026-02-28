@@ -198,8 +198,15 @@ if [ -n "$CLAUDE_CONFIG" ]; then
         PODMAN_ARGS+=(-v "$CLAUDE_JSON:/home/agent/.claude.json:Z")
     fi
 elif [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
-    echo "Claude config:   $HOME/.claude (auto-detected OAuth, read-only)"
-    PODMAN_ARGS+=(-v "$HOME/.claude:/home/agent/.claude:ro")
+    echo "Claude config:   auto-detected OAuth (credentials read-only)"
+    # Use the persistent data directory for writable state (history,
+    # project trust, debug logs, etc.) and overlay just the host's
+    # credentials file read-only.  Mounting the entire ~/.claude as ro
+    # (the previous approach) prevented Claude Code from writing any
+    # state after the trust prompt, causing it to freeze.
+    PODMAN_ARGS+=(-v "$DATA_HOME/claude:/home/agent/.claude:Z")
+    touch "$DATA_HOME/claude/.credentials.json"
+    PODMAN_ARGS+=(-v "$HOME/.claude/.credentials.json:/home/agent/.claude/.credentials.json:ro")
     if [ -f "$HOME/.claude.json" ]; then
         PODMAN_ARGS+=(-v "$HOME/.claude.json:/home/agent/.claude.json:ro")
     fi

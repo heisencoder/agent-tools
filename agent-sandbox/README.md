@@ -83,8 +83,10 @@ OAuth session state).
 
 **Auto-detection:** If neither `ANTHROPIC_API_KEY` nor `--claude-config`
 is set, and `~/.claude/.credentials.json` exists on the host, the script
-automatically mounts `~/.claude` **read-only** so your OAuth tokens are
-available without any extra flags.
+automatically mounts the credentials file **read-only** into the
+container's writable `~/.claude` directory so your OAuth tokens are
+available without any extra flags.  The host's `~/.claude.json` is also
+mounted read-only if present.
 
 ### GitHub CLI & Git Credentials
 
@@ -173,15 +175,24 @@ Environment variables:
 
 ### Claude Code freezes after trusting the folder
 
-The most common cause is a **git credential helper that blocks on input**.
-The container bind-mounts your host `~/.gitconfig`, which may reference a
-credential helper (e.g. `gh auth git-credential` or a keyring-based helper).
-During initialization Claude Code runs git commands to inspect the project;
-if any of those trigger the credential helper and it tries to prompt for
-input, it hangs because the helper's stdin is a pipe with no reader.
+Two common causes:
 
-The script already sets `GIT_TERMINAL_PROMPT=0` and `GH_PROMPT_DISABLED=1`
-to force immediate failure instead of blocking.  If you still see a freeze:
+1. **Read-only `~/.claude` mount** — if auto-detected OAuth previously
+   mounted the entire `~/.claude` directory read-only, Claude Code could
+   not write trust settings, history, or debug logs, causing it to freeze.
+   This is now fixed: the script mounts a writable data directory and
+   overlays only the credentials file read-only.
+
+2. **Git credential helper blocking on input** — the container
+   bind-mounts your host `~/.gitconfig`, which may reference a credential
+   helper (e.g. `gh auth git-credential` or a keyring-based helper).
+   During initialization Claude Code runs git commands to inspect the
+   project; if any of those trigger the credential helper and it tries to
+   prompt for input, it hangs because the helper's stdin is a pipe with
+   no reader.
+
+The script sets `GIT_TERMINAL_PROMPT=0` and `GH_PROMPT_DISABLED=1` to
+force immediate failure instead of blocking.  If you still see a freeze:
 
 1. **Debug interactively** — launch a shell and test git:
 
