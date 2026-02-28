@@ -23,7 +23,7 @@ jobs:
         run: podman --version
 
       - name: Build container image with Podman
-        run: podman build --format docker --layers -t agent-sandbox agent-sandbox/
+        run: podman build --layers -t agent-sandbox agent-sandbox/
 
       - name: Verify basic system tools
         run: |
