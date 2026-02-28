@@ -234,6 +234,16 @@ if [ "$NO_NETWORK" = true ]; then
     PODMAN_ARGS+=(--network=none)
 fi
 
+# Prevent interactive prompts from blocking inside the container.
+# After trust, Claude Code runs git commands to inspect the project.
+# If the host's .gitconfig references a credential helper (e.g.
+# "gh auth git-credential") and it needs to re-authenticate, it
+# would prompt on a pipe that nobody is reading — hanging forever.
+PODMAN_ARGS+=(
+    -e "GIT_TERMINAL_PROMPT=0"
+    -e "GH_PROMPT_DISABLED=1"
+)
+
 # Pass API keys / tokens via environment (if set on the host)
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     PODMAN_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")

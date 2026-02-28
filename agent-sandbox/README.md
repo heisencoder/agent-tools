@@ -169,6 +169,50 @@ Environment variables:
   GITHUB_TOKEN           GitHub token (alternative to GH_TOKEN)
 ```
 
+## Troubleshooting
+
+### Claude Code freezes after trusting the folder
+
+The most common cause is a **git credential helper that blocks on input**.
+The container bind-mounts your host `~/.gitconfig`, which may reference a
+credential helper (e.g. `gh auth git-credential` or a keyring-based helper).
+During initialization Claude Code runs git commands to inspect the project;
+if any of those trigger the credential helper and it tries to prompt for
+input, it hangs because the helper's stdin is a pipe with no reader.
+
+The script already sets `GIT_TERMINAL_PROMPT=0` and `GH_PROMPT_DISABLED=1`
+to force immediate failure instead of blocking.  If you still see a freeze:
+
+1. **Debug interactively** — launch a shell and test git:
+
+   ```bash
+   ./agent-sandbox/run-agent.sh --agent shell ./project
+   # inside the container:
+   git status            # should work instantly
+   git ls-remote origin  # may hang if DNS or credentials are broken
+   ```
+
+2. **DNS issues** — Ubuntu 24.04 uses `systemd-resolved` on `127.0.0.53`,
+   which the container's network namespace cannot reach directly.  Podman
+   normally rewrites `/etc/resolv.conf` for the container, but if DNS is
+   broken you can force a public resolver:
+
+   ```bash
+   ./agent-sandbox/run-agent.sh --podman-arg '--dns=8.8.8.8' ./project
+   ```
+
+3. **Skip the credential helper entirely** — override it inside the container:
+
+   ```bash
+   ./agent-sandbox/run-agent.sh --podman-arg '-e' \
+       --podman-arg 'GIT_CONFIG_COUNT=1' \
+       --podman-arg '-e' \
+       --podman-arg 'GIT_CONFIG_KEY_0=credential.helper' \
+       --podman-arg '-e' \
+       --podman-arg 'GIT_CONFIG_VALUE_0=' \
+       ./project
+   ```
+
 ## Development
 
 ### Building locally
