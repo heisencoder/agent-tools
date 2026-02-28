@@ -3,7 +3,7 @@
 #
 # The container gets:
 #   - Read-write access to the project directory
-#   - Persistent agent config and history across sessions
+#   - Persistent home directory (runtime installs survive restarts)
 #   - Rootless Podman user-namespace isolation
 #
 # Usage:
@@ -74,14 +74,14 @@ Authentication:
 
   Auto-detection: If neither ANTHROPIC_API_KEY nor --claude-config is set,
   and ~/.claude/.credentials.json exists, the script will automatically
-  mount ~/.claude read-only for OAuth support.
+  mount ~/.claude for OAuth support.
 
 GitHub:
-  If ~/.config/gh exists on the host, it is bind-mounted read-only into
-  the container so that 'gh' commands authenticate automatically.
+  If ~/.config/gh exists on the host, it is bind-mounted into the
+  container so that 'gh' commands authenticate automatically.
 
-  If ~/.gitconfig exists, it is also mounted read-only so that git
-  picks up your identity (user.name, user.email) and credential helpers.
+  If ~/.gitconfig exists, it is also mounted so that git picks up your
+  identity (user.name, user.email) and credential helpers.
 
   You can also set GH_TOKEN or GITHUB_TOKEN in your environment — these
   are passed into the container automatically.
@@ -137,16 +137,16 @@ fi
 # -----------------------------------------------------------------
 # Set up persistent data directories
 # -----------------------------------------------------------------
-mkdir -p "$DATA_HOME"/{claude,config,history}
+mkdir -p "$DATA_HOME"/home
 
 # Previous container runs under a different user-namespace mapping may
 # have created files owned by subordinate UIDs (e.g. 165536), making
 # them inaccessible to the host user.  Scan for any file not owned by
 # the current user and, if found, reclaim the entire data tree via
 # "podman unshare" where UID 0 maps to the host user's real UID.
-if [ -n "$(find "$DATA_HOME" -not -uid "$(id -u)" -print -quit 2>/dev/null)" ]; then
+if [ -n "$(find "$DATA_HOME/home" -not -uid "$(id -u)" -print -quit 2>/dev/null)" ]; then
     echo "Reclaiming data directory ownership..." >&2
-    podman unshare chown -R 0:0 "$DATA_HOME"/{claude,config,history} 2>/dev/null || true
+    podman unshare chown -R 0:0 "$DATA_HOME/home" 2>/dev/null || true
 fi
 
 echo "Data directory:  $DATA_HOME"
@@ -174,9 +174,10 @@ PODMAN_ARGS=(
     --userns=keep-id:uid=1000,gid=1000
     # Mount the project directory (read-write)
     -v "$PROJECT_DIR:/workspace:Z"
-    # Mount persistent config and history
-    -v "$DATA_HOME/config:/home/agent/.config:Z"
-    -v "$DATA_HOME/history:/home/agent/.local/share:Z"
+    # Persistent home: tools installed at runtime (extra crates, pip
+    # packages, etc.) survive container restarts.  The entrypoint
+    # populates this from the image template on first run.
+    -v "$DATA_HOME/home:/home/agent:Z"
     # Working directory
     -w /workspace
     # Security: drop all capabilities, re-add only what's needed
@@ -192,17 +193,14 @@ PODMAN_ARGS=(
 # -----------------------------------------------------------------
 # Claude Code config / auth mounts
 # -----------------------------------------------------------------
-# Determine how to mount ~/.claude:
-#   1. Explicit --claude-config: mount that directory (read-write)
-#   2. No --claude-config, no ANTHROPIC_API_KEY, but ~/.claude/.credentials.json
-#      exists: auto-mount host's ~/.claude (read-write, shared)
-#   3. Otherwise: mount the data dir's claude/ subdir
+# Overlay the host's Claude config into the persistent home when
+# available (explicit --claude-config or auto-detected OAuth).
+# Otherwise ~/.claude lives inside the persistent home volume as-is.
 
 if [ -n "$CLAUDE_CONFIG" ]; then
     CLAUDE_CONFIG="$(cd "$CLAUDE_CONFIG" && pwd)"
     echo "Claude config:   $CLAUDE_CONFIG (shared)"
     PODMAN_ARGS+=(-v "$CLAUDE_CONFIG:/home/agent/.claude:Z")
-    # Also mount ~/.claude.json if it exists (required for OAuth session state)
     CLAUDE_JSON="${CLAUDE_CONFIG%/.claude}/.claude.json"
     if [ -f "$CLAUDE_JSON" ]; then
         PODMAN_ARGS+=(-v "$CLAUDE_JSON:/home/agent/.claude.json:Z")
@@ -213,8 +211,6 @@ elif [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -f "$HOME/.claude/.credentials.json" ]
     if [ -f "$HOME/.claude.json" ]; then
         PODMAN_ARGS+=(-v "$HOME/.claude.json:/home/agent/.claude.json:Z")
     fi
-else
-    PODMAN_ARGS+=(-v "$DATA_HOME/claude:/home/agent/.claude:Z")
 fi
 
 # -----------------------------------------------------------------

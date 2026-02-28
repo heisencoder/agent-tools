@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl wget ca-certificates gnupg \
     less vim jq fzf unzip man-db procps \
     build-essential pkg-config libssl-dev \
+    clang lld \
     iproute2 \
     python3 python3-pip python3-venv \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -68,13 +69,18 @@ WORKDIR /workspace
 
 ENV HOME=/home/agent
 ENV NPM_CONFIG_PREFIX=/home/agent/.npm-global
-ENV PATH="$PATH:/home/agent/.npm-global/bin:/home/agent/.local/bin"
+ENV PATH="/home/agent/.cargo/bin:/home/agent/.npm-global/bin:/home/agent/.local/bin:$PATH"
 ENV SHELL=/bin/bash
 ENV EDITOR=vim
 ENV VISUAL=vim
 
 # -------------------------------------------------------------------
-# 6. Install coding agents
+# 6. Install Rust toolchain (stable)
+# -------------------------------------------------------------------
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+# -------------------------------------------------------------------
+# 7. Install coding agents
 # -------------------------------------------------------------------
 # Claude Code
 RUN npm install -g @anthropic-ai/claude-code@latest
@@ -83,10 +89,22 @@ RUN npm install -g @anthropic-ai/claude-code@latest
 RUN npm install -g @openai/codex@latest
 
 # -------------------------------------------------------------------
-# 7. Container metadata
+# 8. Save home directory template for persistent-home initialization.
+#    When run-agent.sh mounts a persistent volume over /home/agent,
+#    the entrypoint copies this template into the empty volume once,
+#    so tools installed during the image build survive restarts.
+# -------------------------------------------------------------------
+USER root
+RUN cp -a /home/agent /home/agent.skel
+COPY --chmod=755 entrypoint.sh /usr/local/bin/entrypoint.sh
+USER agent
+
+# -------------------------------------------------------------------
+# 9. Container metadata
 # -------------------------------------------------------------------
 LABEL org.opencontainers.image.title="agent-sandbox" \
       org.opencontainers.image.description="Secure container for running coding agents with rootless isolation" \
       org.opencontainers.image.source="https://github.com/heisencoder/agent-tools"
 
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/bin/bash"]
