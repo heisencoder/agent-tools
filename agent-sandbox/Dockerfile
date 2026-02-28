@@ -20,43 +20,23 @@ ENV TZ="$TZ"
 # 1. Install system packages: dev tools, networking, security
 # -------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Core development tools
-    git \
-    curl \
-    wget \
-    ca-certificates \
-    gnupg2 \
-    sudo \
-    # Shells and terminal utilities
-    zsh \
-    less \
-    vim \
-    nano \
-    jq \
-    fzf \
-    unzip \
-    man-db \
-    procps \
-    # Build essentials (for native extensions)
-    build-essential \
-    pkg-config \
-    libssl-dev \
-    # Network and firewall tools
-    iptables \
-    ipset \
-    iproute2 \
-    dnsutils \
-    # Python 3 (for Codex and general scripting)
-    python3 \
-    python3-pip \
-    python3-venv \
+    git curl wget ca-certificates gnupg2 sudo \
+    zsh less vim nano jq fzf unzip man-db procps \
+    build-essential pkg-config libssl-dev \
+    iptables ipset iproute2 dnsutils \
+    python3 python3-pip python3-venv \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # -------------------------------------------------------------------
 # 2. Install Node.js 20 LTS (for Claude Code)
 # -------------------------------------------------------------------
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
+ARG NODE_MAJOR=20
+RUN mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+       | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
+       > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update && apt-get install -y --no-install-recommends nodejs \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # -------------------------------------------------------------------
