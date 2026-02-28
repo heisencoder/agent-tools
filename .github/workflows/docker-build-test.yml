@@ -1,0 +1,93 @@
+name: Build and Test Container Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'agent-sandbox/**'
+      - '.github/workflows/docker-build-test.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'agent-sandbox/**'
+      - '.github/workflows/docker-build-test.yml'
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Podman version
+        run: podman --version
+
+      - name: Build container image with Podman
+        run: podman build --layers -t agent-sandbox agent-sandbox/
+
+      - name: Verify basic system tools
+        run: |
+          echo "--- Node.js ---"
+          podman run --rm agent-sandbox node --version
+          echo "--- npm ---"
+          podman run --rm agent-sandbox npm --version
+          echo "--- Python 3 ---"
+          podman run --rm agent-sandbox python3 --version
+          echo "--- Git ---"
+          podman run --rm agent-sandbox git --version
+          echo "--- curl ---"
+          podman run --rm agent-sandbox curl --version | head -1
+          echo "--- jq ---"
+          podman run --rm agent-sandbox jq --version
+          echo "--- GitHub CLI ---"
+          podman run --rm agent-sandbox gh --version
+
+      - name: Verify coding agents are installed
+        run: |
+          echo "--- Claude Code ---"
+          podman run --rm agent-sandbox claude --version
+          echo "--- OpenAI Codex ---"
+          podman run --rm agent-sandbox codex --version
+
+      - name: Verify non-root user
+        run: |
+          WHOAMI=$(podman run --rm agent-sandbox whoami)
+          echo "Running as: $WHOAMI"
+          if [ "$WHOAMI" != "agent" ]; then
+            echo "ERROR: Container should run as 'agent', not '$WHOAMI'"
+            exit 1
+          fi
+
+      - name: Verify working directory
+        run: |
+          WORKDIR=$(podman run --rm agent-sandbox pwd)
+          echo "Working directory: $WORKDIR"
+          if [ "$WORKDIR" != "/workspace" ]; then
+            echo "ERROR: Working directory should be /workspace, not '$WORKDIR'"
+            exit 1
+          fi
+
+      - name: Verify shell environment
+        run: |
+          SHELL_PATH=$(podman run --rm agent-sandbox sh -c 'echo $SHELL')
+          echo "Default shell: $SHELL_PATH"
+          if [ "$SHELL_PATH" != "/bin/bash" ]; then
+            echo "ERROR: Default shell should be /bin/bash, not '$SHELL_PATH'"
+            exit 1
+          fi
+
+      - name: Test bind mount capability
+        run: |
+          mkdir -p /tmp/test-project
+          echo "hello from host" > /tmp/test-project/test.txt
+          CONTENT=$(podman run --rm -v /tmp/test-project:/workspace agent-sandbox cat /workspace/test.txt)
+          echo "Mount test result: $CONTENT"
+          if [ "$CONTENT" != "hello from host" ]; then
+            echo "ERROR: Bind mount test failed"
+            exit 1
+          fi
+
+      - name: Test Python venv creation
+        run: |
+          podman run --rm agent-sandbox python3 -m venv /tmp/testvenv
+          echo "Python venv creation succeeded"
