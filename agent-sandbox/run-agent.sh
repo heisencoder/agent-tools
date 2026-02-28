@@ -139,17 +139,15 @@ fi
 # -----------------------------------------------------------------
 mkdir -p "$DATA_HOME"/{claude,config,history}
 
-# Previous container runs under the default user-namespace mapping
-# (before --userns=keep-id:uid=1000,gid=1000) may have created files
-# owned by subordinate UIDs (e.g. 166536), making the data directories
-# inaccessible to the host user.  Detect this and reclaim ownership
-# via podman unshare, where UID 0 maps to the host user's real UID.
-for _dir in "$DATA_HOME"/{claude,config,history}; do
-    if [ ! -w "$_dir" ]; then
-        echo "Reclaiming data directory: $_dir" >&2
-        podman unshare chown -R 0:0 "$_dir" || true
-    fi
-done
+# Previous container runs under a different user-namespace mapping may
+# have created files owned by subordinate UIDs (e.g. 165536), making
+# them inaccessible to the host user.  Scan for any file not owned by
+# the current user and, if found, reclaim the entire data tree via
+# "podman unshare" where UID 0 maps to the host user's real UID.
+if [ -n "$(find "$DATA_HOME" -not -uid "$(id -u)" -print -quit 2>/dev/null)" ]; then
+    echo "Reclaiming data directory ownership..." >&2
+    podman unshare chown -R 0:0 "$DATA_HOME"/{claude,config,history} 2>/dev/null || true
+fi
 
 echo "Data directory:  $DATA_HOME"
 echo "Project:         $PROJECT_DIR"
