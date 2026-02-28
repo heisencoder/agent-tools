@@ -57,7 +57,7 @@ RUN userdel -r ubuntu 2>/dev/null || true \
     && groupdel ubuntu 2>/dev/null || true \
     && groupadd --gid 1000 agent \
     && useradd --uid 1000 --gid 1000 -m -s /bin/bash agent \
-    && mkdir -p /home/agent/.claude /home/agent/.local/share/npm-global \
+    && mkdir -p /home/agent/.claude /home/agent/.npm-global \
     && chown -R agent:agent /home/agent
 
 # -------------------------------------------------------------------
@@ -67,8 +67,8 @@ USER agent
 WORKDIR /workspace
 
 ENV HOME=/home/agent
-ENV NPM_CONFIG_PREFIX=/home/agent/.local/share/npm-global
-ENV PATH="$PATH:/home/agent/.local/share/npm-global/bin:/home/agent/.local/bin"
+ENV NPM_CONFIG_PREFIX=/home/agent/.npm-global
+ENV PATH="$PATH:/home/agent/.npm-global/bin:/home/agent/.local/bin"
 ENV SHELL=/bin/bash
 ENV EDITOR=vim
 ENV VISUAL=vim
