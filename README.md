@@ -20,7 +20,7 @@ strong isolation guarantees.
   `~/.claude` into the container)
 - **OpenAI Codex support** via API key
 - **Security hardened** — capabilities dropped, no-new-privileges, optional
-  network firewall with domain allowlist
+  full network isolation
 - **OCI-compliant Dockerfile** — builds with both Podman and Docker
 
 **Quick start:**

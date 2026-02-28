@@ -13,8 +13,7 @@ to another. This package provides:
 - **Per-client data directories** — each client gets its own agent config,
   conversation history, and workspace
 - **Minimal attack surface** — capabilities dropped, `no-new-privileges` enforced
-- **Optional network firewall** — allowlist-only outbound access to APIs and
-  package registries
+- **Network isolation** — full network disable via `--no-network`
 - **Multi-agent support** — run Claude Code, OpenAI Codex, or a plain shell
 
 ## Quick Start
@@ -131,30 +130,16 @@ Client A's container has zero access to Client B's data or project files.
 | Bind mounts | Only project dir (rw) and client config (rw) are mounted |
 | SELinux labels | `:Z` relabeling for proper MAC enforcement |
 
-### Optional network firewall
+### Network isolation
 
-Use `--firewall` to restrict outbound traffic to an allowlist:
-
-```bash
-./agent-sandbox/run-agent.sh --client acme --agent claude --firewall ./project
-```
-
-Allowed destinations:
-- `api.anthropic.com` (Claude)
-- `api.openai.com` (Codex)
-- `github.com`, `api.github.com` (Git operations)
-- `registry.npmjs.org`, `pypi.org` (Package installs)
-- DNS (port 53) and SSH (port 22)
-
-Everything else is blocked.
-
-### Full network isolation
-
-For maximum security, disable networking entirely:
+Disable networking entirely with `--no-network`:
 
 ```bash
 ./agent-sandbox/run-agent.sh --client acme --agent claude --no-network ./project
 ```
+
+This passes `--network=none` to Podman, completely preventing the container
+from making any network connections.
 
 ## run-agent.sh Reference
 
@@ -171,7 +156,6 @@ Options:
   --image <image>        Container image (default: agent-sandbox:latest)
   --resume               Reattach to an existing container for this client
   --no-network           Disable all container networking
-  --firewall             Enable the allowlist-based firewall inside the container
   --mount <host:cont>    Additional bind mount (read-only)
   --mount-rw <host:cont> Additional bind mount (read-write)
   --podman-arg <arg>     Pass additional argument to podman run

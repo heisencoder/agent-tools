@@ -20,10 +20,10 @@ ENV TZ="$TZ"
 # 1. Install system packages: dev tools, networking, security
 # -------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl wget ca-certificates gnupg sudo \
+    git curl wget ca-certificates gnupg \
     zsh less vim nano jq fzf unzip man-db procps \
     build-essential pkg-config libssl-dev \
-    iptables ipset iproute2 dnsutils \
+    iproute2 \
     python3 python3-pip python3-venv \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -60,13 +60,6 @@ RUN userdel -r ubuntu 2>/dev/null || true \
     && useradd --uid 1000 --gid 1000 -m -s /bin/zsh agent \
     && mkdir -p /home/agent/.claude /home/agent/.local/share/npm-global \
     && chown -R agent:agent /home/agent
-
-# Allow agent to run firewall script as root (for optional network restriction)
-COPY init-firewall.sh /usr/local/bin/init-firewall.sh
-RUN chmod +x /usr/local/bin/init-firewall.sh \
-    && echo "agent ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" \
-    > /etc/sudoers.d/agent-firewall \
-    && chmod 0440 /etc/sudoers.d/agent-firewall
 
 # -------------------------------------------------------------------
 # 5. Switch to non-root user and configure environment

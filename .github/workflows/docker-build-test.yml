@@ -67,11 +67,6 @@ jobs:
             exit 1
           fi
 
-      - name: Verify firewall script exists and is executable
-        run: |
-          podman run --rm agent-sandbox test -x /usr/local/bin/init-firewall.sh
-          echo "Firewall script is present and executable"
-
       - name: Verify shell environment
         run: |
           SHELL_PATH=$(podman run --rm agent-sandbox sh -c 'echo $SHELL')

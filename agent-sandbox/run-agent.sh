@@ -28,7 +28,6 @@ AGENT="claude"
 PROJECT_DIR=""
 RESUME=false
 NO_NETWORK=false
-FIREWALL=false
 CLAUDE_CONFIG=""
 EXTRA_MOUNTS=()
 EXTRA_PODMAN_ARGS=()
@@ -56,7 +55,6 @@ Options:
   --image <image>       Container image (default: agent-sandbox:latest)
   --resume              Reattach to an existing container for this client
   --no-network          Disable all container networking
-  --firewall            Enable the allowlist-based firewall inside the container
   --mount <host:cont>   Additional bind mount (read-only by default)
   --mount-rw <host:cont> Additional bind mount (read-write)
   --podman-arg <arg>    Pass additional argument to podman run
@@ -105,7 +103,6 @@ while [[ $# -gt 0 ]]; do
         --image)         IMAGE="$2"; shift 2 ;;
         --resume)        RESUME=true; shift ;;
         --no-network)    NO_NETWORK=true; shift ;;
-        --firewall)      FIREWALL=true; shift ;;
         --mount)         EXTRA_MOUNTS+=("-v" "$2:ro"); shift 2 ;;
         --mount-rw)      EXTRA_MOUNTS+=("-v" "$2"); shift 2 ;;
         --podman-arg)    EXTRA_PODMAN_ARGS+=("$2"); shift 2 ;;
@@ -249,13 +246,4 @@ esac
 # Launch
 # -----------------------------------------------------------------
 echo "Starting container..."
-
-if [ "$FIREWALL" = true ]; then
-    # Start detached, apply firewall, then attach
-    podman run -d "${PODMAN_ARGS[@]}" "$IMAGE" sleep infinity
-    echo "Applying network firewall..."
-    podman exec --user root "$CONTAINER_NAME" sudo /usr/local/bin/init-firewall.sh
-    podman exec -it "$CONTAINER_NAME" "${CONTAINER_CMD[@]}"
-else
-    exec podman run "${PODMAN_ARGS[@]}" "$IMAGE" "${CONTAINER_CMD[@]}"
-fi
+exec podman run "${PODMAN_ARGS[@]}" "$IMAGE" "${CONTAINER_CMD[@]}"
