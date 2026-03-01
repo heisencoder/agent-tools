@@ -12,7 +12,7 @@
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG TZ=UTC
+ARG TZ=America/Denver
 ENV TZ="$TZ"
 
 # -------------------------------------------------------------------
@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl wget ca-certificates gnupg \
     less vim jq fzf unzip man-db procps \
     build-essential pkg-config libssl-dev \
+    clang lld \
     iproute2 \
     python3 python3-pip python3-venv \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -57,7 +58,7 @@ RUN userdel -r ubuntu 2>/dev/null || true \
     && groupdel ubuntu 2>/dev/null || true \
     && groupadd --gid 1000 agent \
     && useradd --uid 1000 --gid 1000 -m -s /bin/bash agent \
-    && mkdir -p /home/agent/.claude /home/agent/.local/share/npm-global \
+    && mkdir -p /home/agent/.claude /home/agent/.npm-global \
     && chown -R agent:agent /home/agent
 
 # -------------------------------------------------------------------
@@ -67,8 +68,8 @@ USER agent
 WORKDIR /workspace
 
 ENV HOME=/home/agent
-ENV NPM_CONFIG_PREFIX=/home/agent/.local/share/npm-global
-ENV PATH="$PATH:/home/agent/.local/share/npm-global/bin:/home/agent/.local/bin"
+ENV NPM_CONFIG_PREFIX=/home/agent/.npm-global
+ENV PATH="/home/agent/.cargo/bin:/home/agent/.npm-global/bin:/home/agent/.local/bin:$PATH"
 ENV SHELL=/bin/bash
 ENV EDITOR=vim
 ENV VISUAL=vim
@@ -83,10 +84,24 @@ RUN npm install -g @anthropic-ai/claude-code@latest
 RUN npm install -g @openai/codex@latest
 
 # -------------------------------------------------------------------
-# 7. Container metadata
+# 7. Save home directory template for persistent-home initialization.
+#    When run-agent.sh mounts a persistent volume over /home/agent,
+#    the entrypoint copies this template into the empty volume once,
+#    so tools installed during the image build (npm packages, etc.)
+#    are available immediately.  Tools installed at runtime (e.g.
+#    rustup, pip packages) persist in the volume across restarts.
+# -------------------------------------------------------------------
+USER root
+RUN cp -a /home/agent /home/agent.skel
+COPY --chmod=755 entrypoint.sh /usr/local/bin/entrypoint.sh
+USER agent
+
+# -------------------------------------------------------------------
+# 8. Container metadata
 # -------------------------------------------------------------------
 LABEL org.opencontainers.image.title="agent-sandbox" \
       org.opencontainers.image.description="Secure container for running coding agents with rootless isolation" \
       org.opencontainers.image.source="https://github.com/heisencoder/agent-tools"
 
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/bin/bash"]

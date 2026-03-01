@@ -3,7 +3,7 @@
 #
 # The container gets:
 #   - Read-write access to the project directory
-#   - Persistent agent config and history across sessions
+#   - Persistent home directory (runtime installs survive restarts)
 #   - Rootless Podman user-namespace isolation
 #
 # Usage:
@@ -74,13 +74,25 @@ Authentication:
 
   Auto-detection: If neither ANTHROPIC_API_KEY nor --claude-config is set,
   and ~/.claude/.credentials.json exists, the script will automatically
-  mount ~/.claude read-only for OAuth support.
+  mount ~/.claude for OAuth support.
+
+GitHub:
+  If ~/.config/gh exists on the host, it is bind-mounted into the
+  container so that 'gh' commands authenticate automatically.
+
+  If ~/.gitconfig exists, it is also mounted so that git picks up your
+  identity (user.name, user.email) and credential helpers.
+
+  You can also set GH_TOKEN or GITHUB_TOKEN in your environment — these
+  are passed into the container automatically.
 
 Environment variables:
   AGENT_SANDBOX_DATA    Base directory for persistent agent state
                         (default: ~/.local/share/agent-sandbox)
   ANTHROPIC_API_KEY     API key for Claude Code
   OPENAI_API_KEY        API key for OpenAI Codex
+  GH_TOKEN              GitHub personal access token (used by gh CLI)
+  GITHUB_TOKEN          GitHub token (alternative to GH_TOKEN)
 EOF
     exit 0
 }
@@ -125,7 +137,17 @@ fi
 # -----------------------------------------------------------------
 # Set up persistent data directories
 # -----------------------------------------------------------------
-mkdir -p "$DATA_HOME"/{claude,config,history}
+mkdir -p "$DATA_HOME"/home
+
+# Previous container runs under a different user-namespace mapping may
+# have created files owned by subordinate UIDs (e.g. 165536), making
+# them inaccessible to the host user.  Scan for any file not owned by
+# the current user and, if found, reclaim the entire data tree via
+# "podman unshare" where UID 0 maps to the host user's real UID.
+if [ -n "$(find "$DATA_HOME/home" -not -uid "$(id -u)" -print -quit 2>/dev/null)" ]; then
+    echo "Reclaiming data directory ownership..." >&2
+    podman unshare chown -R 0:0 "$DATA_HOME/home" 2>/dev/null || true
+fi
 
 echo "Data directory:  $DATA_HOME"
 echo "Project:         $PROJECT_DIR"
@@ -144,12 +166,18 @@ PODMAN_ARGS=(
     --name "$CONTAINER_NAME"
     --rm
     -it
-    --userns=keep-id
+    # Map the host caller's UID/GID to the container's "agent" user
+    # (UID 1000, GID 1000).  Without the :uid/gid suffix, --userns=keep-id
+    # maps the host UID as-is, which fails when it doesn't match 1000
+    # (e.g. "groups: cannot find name for group ID 1002").
+    # Requires Podman >= 4.3.
+    --userns=keep-id:uid=1000,gid=1000
     # Mount the project directory (read-write)
     -v "$PROJECT_DIR:/workspace:Z"
-    # Mount persistent config and history
-    -v "$DATA_HOME/config:/home/agent/.config:Z"
-    -v "$DATA_HOME/history:/home/agent/.local/share:Z"
+    # Persistent home: tools installed at runtime (extra crates, pip
+    # packages, etc.) survive container restarts.  The entrypoint
+    # populates this from the image template on first run.
+    -v "$DATA_HOME/home:/home/agent:Z"
     # Working directory
     -w /workspace
     # Security: drop all capabilities, re-add only what's needed
@@ -165,29 +193,42 @@ PODMAN_ARGS=(
 # -----------------------------------------------------------------
 # Claude Code config / auth mounts
 # -----------------------------------------------------------------
-# Determine how to mount ~/.claude:
-#   1. Explicit --claude-config: mount that directory (read-write)
-#   2. No --claude-config, no ANTHROPIC_API_KEY, but ~/.claude/.credentials.json
-#      exists: auto-mount ~/.claude read-only for OAuth
-#   3. Otherwise: mount the data dir's claude/ subdir
+# Overlay the host's Claude config into the persistent home when
+# available (explicit --claude-config or auto-detected OAuth).
+# Otherwise ~/.claude lives inside the persistent home volume as-is.
 
 if [ -n "$CLAUDE_CONFIG" ]; then
     CLAUDE_CONFIG="$(cd "$CLAUDE_CONFIG" && pwd)"
     echo "Claude config:   $CLAUDE_CONFIG (shared)"
     PODMAN_ARGS+=(-v "$CLAUDE_CONFIG:/home/agent/.claude:Z")
-    # Also mount ~/.claude.json if it exists (required for OAuth session state)
     CLAUDE_JSON="${CLAUDE_CONFIG%/.claude}/.claude.json"
     if [ -f "$CLAUDE_JSON" ]; then
         PODMAN_ARGS+=(-v "$CLAUDE_JSON:/home/agent/.claude.json:Z")
     fi
 elif [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
-    echo "Claude config:   $HOME/.claude (auto-detected OAuth, read-only)"
-    PODMAN_ARGS+=(-v "$HOME/.claude:/home/agent/.claude:ro")
+    echo "Claude config:   auto-detected OAuth ($HOME/.claude shared)"
+    PODMAN_ARGS+=(-v "$HOME/.claude:/home/agent/.claude:Z")
     if [ -f "$HOME/.claude.json" ]; then
-        PODMAN_ARGS+=(-v "$HOME/.claude.json:/home/agent/.claude.json:ro")
+        PODMAN_ARGS+=(-v "$HOME/.claude.json:/home/agent/.claude.json:Z")
     fi
-else
-    PODMAN_ARGS+=(-v "$DATA_HOME/claude:/home/agent/.claude:Z")
+fi
+
+# -----------------------------------------------------------------
+# GitHub credentials (gh CLI + git)
+# -----------------------------------------------------------------
+# Mount gh CLI config if available on the host.  This directory
+# contains hosts.yml with OAuth / PAT tokens.
+if [ -d "$HOME/.config/gh" ]; then
+    echo "GitHub CLI:      $HOME/.config/gh (shared)"
+    PODMAN_ARGS+=(-v "$HOME/.config/gh:/home/agent/.config/gh:Z")
+fi
+
+# Mount the user's .gitconfig if it exists (provides git identity,
+# aliases, and credential-helper settings such as
+# "credential.helper = !gh auth git-credential").
+if [ -f "$HOME/.gitconfig" ]; then
+    echo "Git config:      $HOME/.gitconfig (shared)"
+    PODMAN_ARGS+=(-v "$HOME/.gitconfig:/home/agent/.gitconfig:Z")
 fi
 
 # Network isolation
@@ -195,12 +236,28 @@ if [ "$NO_NETWORK" = true ]; then
     PODMAN_ARGS+=(--network=none)
 fi
 
-# Pass API keys via environment (if set on the host)
+# Prevent interactive prompts from blocking inside the container.
+# After trust, Claude Code runs git commands to inspect the project.
+# If the host's .gitconfig references a credential helper (e.g.
+# "gh auth git-credential") and it needs to re-authenticate, it
+# would prompt on a pipe that nobody is reading — hanging forever.
+PODMAN_ARGS+=(
+    -e "GIT_TERMINAL_PROMPT=0"
+    -e "GH_PROMPT_DISABLED=1"
+)
+
+# Pass API keys / tokens via environment (if set on the host)
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     PODMAN_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
 fi
 if [ -n "${OPENAI_API_KEY:-}" ]; then
     PODMAN_ARGS+=(-e "OPENAI_API_KEY=$OPENAI_API_KEY")
+fi
+if [ -n "${GH_TOKEN:-}" ]; then
+    PODMAN_ARGS+=(-e "GH_TOKEN=$GH_TOKEN")
+fi
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    PODMAN_ARGS+=(-e "GITHUB_TOKEN=$GITHUB_TOKEN")
 fi
 
 # Extra mounts
