@@ -12,7 +12,7 @@
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG TZ=UTC
+ARG TZ=America/Denver
 ENV TZ="$TZ"
 
 # -------------------------------------------------------------------
