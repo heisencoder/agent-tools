@@ -58,7 +58,7 @@ run_test "home skel template exists" run_in_image test -d /home/agent.skel/.npm-
 test_bind_mount() {
     echo "hello from host" > "$TEST_TMPDIR/test.txt"
     local actual
-    actual=$(podman run --rm -v "$TEST_TMPDIR:/workspace" "$IMAGE" cat /workspace/test.txt)
+    actual=$(podman run --rm "${USERNS_ARGS[@]}" -v "$TEST_TMPDIR:/workspace" "$IMAGE" cat /workspace/test.txt)
     assert_eq "hello from host" "$actual" "bind mount content"
 }
 run_test "bind mount works" test_bind_mount
