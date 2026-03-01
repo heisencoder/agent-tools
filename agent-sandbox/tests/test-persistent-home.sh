@@ -11,7 +11,7 @@
 source "$(dirname "$0")/helpers.sh"
 
 TEST_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/agent-sandbox-test.XXXXXX")
-trap 'rm -rf "$TEST_TMPDIR"' EXIT
+trap 'podman unshare rm -rf "$TEST_TMPDIR"' EXIT
 
 export PERSISTENT_HOME="$TEST_TMPDIR/home"
 TEST_PROJECT="$TEST_TMPDIR/project"
