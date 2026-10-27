@@ -1,0 +1,238 @@
+#!/bin/bash
+# agent-run — Launch a Claude Code session as a hardened, audited system unit.
+#
+# Each run becomes a transient *system* unit (agent-run-<RUN_ID>.service)
+# started with systemd-run as the agent user.  That gives the session:
+#   - a root-owned cgroup its processes cannot leave, killed as a whole when
+#     claude exits (no leftover daemons)
+#   - a fresh audit session ID (ses) via /etc/pam.d/agent-run, so every exec
+#     auditd records for this run carries an unforgeable label
+#   - sandboxing properties: no new privileges, no vsock/raw sockets, the
+#     resolver/D-Bus/avahi/cups socket directories hidden (host), and an IP
+#     filter limiting it to loopback (+ the VM-side proxy address in VMs)
+#   - AGENT_RUN_ID in its environment (a convenience label only)
+#
+# It always runs the root-owned /usr/local/bin/claude, never a copy on the
+# agent's PATH.  See docs/design/implementation.md, "agent-run".
+#
+# Usage (from the administrator's account):
+#   sudo agent-run [--env host|vm] [--dir PROJECT] [-- CLAUDE_ARGS...]
+#
+# Test-only options (no root needed):
+#   --print       run the pre-launch checks, then print the systemd-run
+#                 command instead of executing it
+#   --root DIR    look for every checked file and helper program under DIR
+#                 (only valid together with --print)
+#
+# Examples:
+#   sudo agent-run --dir /home/agent/work/webapp
+#   sudo agent-run --env vm -- --resume
+#   agent-run --print --root /tmp/stage --env host --dir /tmp
+
+set -euo pipefail
+
+# Fixed PATH: never trust the caller's (sudo normally resets it anyway).
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# -----------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------
+AGENT_USER="agent"            # install.sh rewrites this line for --agent-user
+CLAUDE_LINK="/usr/local/bin/claude"
+CLAUDE_STORE="/opt/claude-code"
+AUDIT_SETTINGS="/etc/claude-code/managed-settings.d/50-agent-audit.json"
+EGRESS_SETTINGS="/etc/claude-code/managed-settings.d/40-agent-egress.json"
+HOOK="/usr/local/lib/agent-audit/claude-audit-hook"
+HOOK_SOCKET="/run/agent-log-shipper/hook.sock"
+# Created by agent-log-shipper while /var/log/audit is below auditd's
+# admin_space_left (auditd may be suspended); removed when space recovers.
+AUDIT_DEGRADED="/run/agent-log-shipper/audit-degraded"
+PTRACE_SCOPE="/proc/sys/kernel/yama/ptrace_scope"
+VM_PROXY_ADDR="192.168.123.1"
+SYSTEMD_RUN="/usr/bin/systemd-run"
+DETECT_VIRT="/usr/bin/systemd-detect-virt"
+NFT="/usr/sbin/nft"
+
+# -----------------------------------------------------------------
+# Defaults
+# -----------------------------------------------------------------
+ENV_KIND=""
+PROJECT=""
+PRINT=false
+ROOT=""
+CLAUDE_ARGS=()
+
+usage() {
+    cat <<'EOF'
+Usage: sudo agent-run [--env host|vm] [--dir PROJECT] [-- CLAUDE_ARGS...]
+
+Start Claude Code (--dangerously-skip-permissions) as the agent user in a
+hardened transient system unit with its own audit session.
+
+Options:
+  --env host|vm   Environment profile (default: vm if `systemd-detect-virt
+                  --vm` succeeds, else host)
+  --dir PROJECT   Working directory for the session (default: current dir)
+  --print         Run the checks, then print the systemd-run command
+                  instead of executing it (no root needed)
+  --root DIR      With --print only: resolve checked paths under DIR
+  --help          Show this help
+
+Arguments after `--` are passed to claude.
+EOF
+}
+
+die() {
+    echo "agent-run: $*" >&2
+    exit 1
+}
+
+# -----------------------------------------------------------------
+# Parse arguments
+# -----------------------------------------------------------------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --env)
+            [ $# -ge 2 ] || die "--env needs a value"
+            ENV_KIND="$2"; shift 2 ;;
+        --env=*)  ENV_KIND="${1#*=}"; shift ;;
+        --dir)
+            [ $# -ge 2 ] || die "--dir needs a value"
+            PROJECT="$2"; shift 2 ;;
+        --dir=*)  PROJECT="${1#*=}"; shift ;;
+        --print)  PRINT=true; shift ;;
+        --root)
+            [ $# -ge 2 ] || die "--root needs a value"
+            ROOT="$2"; shift 2 ;;
+        --root=*) ROOT="${1#*=}"; shift ;;
+        --help|-h) usage; exit 0 ;;
+        --)       shift; CLAUDE_ARGS=("$@"); break ;;
+        *)        usage >&2; die "unknown argument: $1" ;;
+    esac
+done
+
+# --root redirects every check, so it must never be usable for a real
+# launch (e.g. through a future sudoers rule for agent-run).
+if [ -n "$ROOT" ] && ! $PRINT; then
+    die "--root is only allowed together with --print"
+fi
+if ! $PRINT && [ "$(id -u)" -ne 0 ]; then
+    die "must be run as root (sudo agent-run ...)"
+fi
+
+# -----------------------------------------------------------------
+# Environment profile
+# -----------------------------------------------------------------
+if [ -z "$ENV_KIND" ]; then
+    if [ -x "$ROOT$DETECT_VIRT" ] && "$ROOT$DETECT_VIRT" --vm --quiet; then
+        ENV_KIND=vm
+    else
+        ENV_KIND=host
+    fi
+fi
+case "$ENV_KIND" in
+    host|vm) ;;
+    *) die "--env must be host or vm, not '$ENV_KIND'" ;;
+esac
+
+# Project directory: absolute, existing.  Access by the agent user is
+# checked by systemd itself when it changes into it.
+PROJECT="${PROJECT:-$PWD}"
+[ -d "$PROJECT" ] || die "project directory does not exist: $PROJECT"
+PROJECT="$(cd "$PROJECT" && pwd -P)"
+
+# -----------------------------------------------------------------
+# Pre-launch checks (collect every failure, then refuse)
+# -----------------------------------------------------------------
+FAILURES=()
+fail() { FAILURES+=("$*"); }
+
+[ -f "$ROOT$AUDIT_SETTINGS" ] || fail "managed settings missing: $AUDIT_SETTINGS"
+[ -x "$ROOT$HOOK" ]           || fail "audit hook missing or not executable: $HOOK"
+[ -S "$ROOT$HOOK_SOCKET" ]    || fail "hook collector socket missing: $HOOK_SOCKET (is agent-log-shipper running?)"
+[ ! -e "$ROOT$AUDIT_DEGRADED" ] || fail "agent-log-shipper reports audit-degraded ($AUDIT_DEGRADED): free space under /var/log/audit"
+
+# The claude we launch must be the root-owned install from
+# install-claude.sh (a symlink straight to /opt/claude-code/<version>/claude,
+# a regular root-owned file), not something the agent could have replaced.
+claude_target="$(readlink "$ROOT$CLAUDE_LINK" 2>/dev/null || true)"
+if ! [[ "$claude_target" =~ ^$CLAUDE_STORE/[^/]+/claude$ ]] \
+   || [[ "$claude_target" == */../* ]]; then
+    fail "$CLAUDE_LINK is not a symlink to $CLAUDE_STORE/<version>/claude (run install-claude.sh)"
+elif [ -L "$ROOT$claude_target" ] || [ ! -f "$ROOT$claude_target" ] \
+     || [ ! -x "$ROOT$claude_target" ]; then
+    fail "$claude_target is not an executable regular file"
+elif [ -z "$ROOT" ] && [ "$(stat -c %u "$claude_target")" != 0 ]; then
+    fail "$claude_target is not owned by root"
+fi
+
+scope="$(cat "$ROOT$PTRACE_SCOPE" 2>/dev/null || true)"
+if ! [[ "$scope" =~ ^[0-9]+$ ]]; then
+    fail "cannot read $PTRACE_SCOPE (Yama not enabled?)"
+elif [ "$scope" -lt 1 ]; then
+    fail "$PTRACE_SCOPE is $scope; must be >= 1 (see /etc/sysctl.d/60-agent-ptrace.conf)"
+fi
+
+# Phase 1 rule: network properties apply only once egress control is
+# installed; on the host they also require the nftables table to be loaded.
+EGRESS=false
+if [ -f "$ROOT$EGRESS_SETTINGS" ]; then
+    EGRESS=true
+    if [ "$ENV_KIND" = host ] && ! "$ROOT$NFT" list table inet agent_egress >/dev/null 2>&1; then
+        fail "nftables table inet agent_egress is not loaded (agent-egress-nft.service)"
+    fi
+fi
+
+if [ ${#FAILURES[@]} -gt 0 ]; then
+    for f in "${FAILURES[@]}"; do
+        echo "agent-run: refusing to start: $f" >&2
+    done
+    exit 1
+fi
+
+if ! $EGRESS; then
+    echo "WARNING: egress control not installed ($EGRESS_SETTINGS missing); launching without network restrictions" >&2
+fi
+
+# -----------------------------------------------------------------
+# Build the systemd-run command
+# -----------------------------------------------------------------
+RUN_ID="$(date -u +%Y%m%dT%H%M%S)-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+
+CMD=("$SYSTEMD_RUN" --uid="$AGENT_USER" --gid="$AGENT_USER" --pty --wait --collect
+     --unit="agent-run-$RUN_ID"
+     -p PAMName=agent-run
+     -p WorkingDirectory="$PROJECT"
+     -p NoNewPrivileges=yes
+     -p RestrictAddressFamilies="AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+     # RestrictAddressFamilies= is a seccomp filter on socket(2) for the
+     # native ABI only: block the 32-bit ABI and io_uring, which could
+     # otherwise create sockets around it.  EPERM lets runtimes that probe
+     # for io_uring fall back to epoll.
+     -p SystemCallArchitectures=native
+     -p SystemCallFilter="~io_uring_setup io_uring_enter io_uring_register"
+     -p SystemCallErrorNumber=EPERM)
+if $EGRESS; then
+    allow="localhost"
+    [ "$ENV_KIND" = vm ] && allow="localhost $VM_PROXY_ADDR"
+    CMD+=(-p IPAddressDeny=any -p IPAddressAllow="$allow")
+fi
+if [ "$ENV_KIND" = host ]; then
+    # Directories holding world-connectable sockets of daemons that would
+    # act on the agent's behalf (DNS, D-Bus, mDNS, printing).  "-" ignores
+    # a missing path.
+    CMD+=(-p InaccessiblePaths="-/run/systemd/resolve -/run/dbus -/run/avahi-daemon -/run/cups")
+fi
+CMD+=(--setenv=AGENT_RUN_ID="$RUN_ID" --setenv=TERM="${TERM:-dumb}"
+      -- "$CLAUDE_LINK" --dangerously-skip-permissions "${CLAUDE_ARGS[@]}")
+
+if $PRINT; then
+    # One shell-quoted command line, suitable for copy-paste.
+    printf '%q' "${CMD[0]}"
+    printf ' %q' "${CMD[@]:1}"
+    printf '\n'
+    exit 0
+fi
+
+echo "agent-run: starting agent-run-$RUN_ID ($ENV_KIND) in $PROJECT" >&2
+exec "${CMD[@]}"

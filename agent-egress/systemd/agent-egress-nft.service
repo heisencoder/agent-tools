@@ -1,0 +1,27 @@
+# agent-egress-nft.service — Load the agent egress nftables tables early in boot.
+#
+# agent_egress (host agent user) and agent_vmnet (isolated VM bridge).  Each
+# file replaces only its own table.  There is deliberately no ExecStop:
+# stopping this unit must not open egress.  To remove the rules, run
+# `nft delete table inet agent_egress` (and agent_vmnet) as root.
+# agent-egress-proxy.service Requires= this unit, so the proxy does not run
+# if the rules fail to load.
+
+[Unit]
+Description=Agent egress nftables rules
+Documentation=https://github.com/heisencoder/agent-tools/tree/main/agent-egress
+DefaultDependencies=no
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/agent-egress/agent-host.nft
+ExecStart=/usr/sbin/nft -f /etc/agent-egress/agent-vmnet.nft
+ExecReload=/usr/sbin/nft -f /etc/agent-egress/agent-host.nft
+ExecReload=/usr/sbin/nft -f /etc/agent-egress/agent-vmnet.nft
+
+[Install]
+WantedBy=sysinit.target

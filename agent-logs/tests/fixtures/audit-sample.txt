@@ -1,0 +1,37 @@
+type=SYSCALL msg=audit(1793136000.100:501): arch=c000003e syscall=59 success=yes exit=0 a0=55d1c0a0 a1=55d1c0b0 a2=55d1c0c0 a3=8 items=2 ppid=4100 pid=4200 auid=2000 uid=2000 gid=2000 euid=2000 suid=2000 fsuid=2000 egid=2000 sgid=2000 fsgid=2000 tty=pts1 ses=17 comm="bash" exe="/usr/bin/bash" subj=unconfined key="agent-exec"
+type=EXECVE msg=audit(1793136000.100:501): argc=3 a0="bash" a1="-c" a2=6C73202D6C61202F746D702F612062
+type=CWD msg=audit(1793136000.100:501): cwd="/home/agent/project"
+type=PATH msg=audit(1793136000.100:501): item=0 name="/usr/bin/bash" inode=1234 dev=fd:01 mode=0100755 ouid=0 ogid=0 rdev=00:00 nametype=NORMAL cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PATH msg=audit(1793136000.100:501): item=1 name="/lib64/ld-linux-x86-64.so.2" inode=99 dev=fd:01 mode=0100755 ouid=0 ogid=0 rdev=00:00 nametype=NORMAL cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PROCTITLE msg=audit(1793136000.100:501): proctitle=62617368002D63006C73202D6C61202F746D702F612062
+type=EOE msg=audit(1793136000.100:501): 
+type=SYSCALL msg=audit(1793136000.200:502): arch=c000003e syscall=59 success=yes exit=0 a0=1 a1=2 a2=3 a3=0 items=2 ppid=4200 pid=4222 auid=2000 uid=2000 gid=2000 euid=2000 suid=2000 fsuid=2000 egid=2000 sgid=2000 fsgid=2000 tty=pts1 ses=17 comm="ls" exe="/usr/bin/ls" subj=unconfined key="agent-exec"ARCH=x86_64 SYSCALL=execve AUID="agent" UID="agent"
+type=SYSCALL msg=audit(1793136000.201:503): arch=c000003e syscall=59 success=no exit=-2 a0=1 a1=2 a2=3 a3=0 items=1 ppid=4200 pid=4223 auid=2000 uid=2000 gid=2000 euid=2000 suid=2000 fsuid=2000 egid=2000 sgid=2000 fsgid=2000 tty=pts1 ses=17 comm="bash" exe="/usr/bin/bash" subj=unconfined key="agent-exec"
+type=EXECVE msg=audit(1793136000.200:502): argc=3 a0="ls" a1="-la" a2=2F746D702F612062
+type=EXECVE msg=audit(1793136000.201:503): argc=1 a0="nosuchcmd"
+type=CWD msg=audit(1793136000.200:502): cwd=2F686F6D652F6167656E742F6D792070726F6A656374
+type=CWD msg=audit(1793136000.201:503): cwd="/home/agent/project"
+type=PROCTITLE msg=audit(1793136000.200:502): proctitle=6C73002D6C61002F746D702F612062
+type=EOE msg=audit(1793136000.201:503): 
+type=EOE msg=audit(1793136000.200:502): 
+type=SYSCALL msg=audit(1793136000.300:504): arch=c000003e syscall=257 success=yes exit=3 a0=ffffff9c a1=7ffd a2=0 a3=0 items=1 ppid=1 pid=900 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=(none) ses=4294967295 comm="cron" exe="/usr/sbin/cron" subj=unconfined key=(null)
+type=CWD msg=audit(1793136000.300:504): cwd="/"
+type=EOE msg=audit(1793136000.300:504): 
+type=NETFILTER_CFG msg=audit(1793136000.400:505): table=agent_egress:12 family=1 entries=0 op=nft_unregister_table pid=5000 subj=unconfined comm="nft"
+type=SYSCALL msg=audit(1793136000.400:505): arch=c000003e syscall=46 success=yes exit=1024 a0=3 a1=7ffd a2=0 a3=0 items=0 ppid=4999 pid=5000 auid=1000 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts2 ses=3 comm="nft" exe="/usr/sbin/nft" subj=unconfined key=(null)
+type=PROCTITLE msg=audit(1793136000.400:505): proctitle=6E6674002D66002F6574632F6E667461626C65732E642F782E6E6674
+type=EOE msg=audit(1793136000.400:505): 
+type=CONFIG_CHANGE msg=audit(1793136000.500:506): auid=1000 ses=3 subj=unconfined op=remove_rule key="agent-exec" list=4 res=1
+type=SYSCALL msg=audit(1793136000.600:507): arch=c000003e syscall=257 success=yes exit=3 a0=ffffff9c a1=7ffd a2=0 a3=0 items=1 ppid=4100 pid=4300 auid=2000 uid=2000 gid=2000 euid=2000 suid=2000 fsuid=2000 egid=2000 sgid=2000 fsgid=2000 tty=pts1 ses=17 comm="cat" exe="/usr/bin/cat" subj=unconfined key="agent-secret-read"
+type=CWD msg=audit(1793136000.600:507): cwd="/home/agent"
+type=PATH msg=audit(1793136000.600:507): item=0 name="/home/agent/.ssh/id_ed25519" inode=555 dev=fd:01 mode=0100600 ouid=2000 ogid=2000 rdev=00:00 nametype=NORMAL cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PROCTITLE msg=audit(1793136000.600:507): proctitle=636174002E7373682F69645F65643235353139
+type=EOE msg=audit(1793136000.600:507): 
+type=SYSCALL msg=audit(1793136000.700:508): arch=c000003e syscall=59 success=yes exit=0 a0=1 a1=2 a2=3 a3=0 items=2 ppid=4200 pid=4400 auid=2000 uid=2000 gid=2000 euid=2000 suid=2000 fsuid=2000 egid=2000 sgid=2000 fsgid=2000 tty=pts1 ses=17 comm="echo" exe="/usr/bin/echo" subj=unconfined key="agent-exec"
+type=EXECVE msg=audit(1793136000.700:508): argc=2 a0="echo" a1_len=20 a1[0]=41414141414141414141 a1[1]=42424242424242424242
+type=CWD msg=audit(1793136000.700:508): cwd="/home/agent/project"
+type=EOE msg=audit(1793136000.700:508): 
+type=SYSCALL msg=audit(1793136000.800:509): arch=c000003e syscall=59 success=yes exit=0 a0=1 a1=2 a2=3 a3=0 items=2 ppid=4100 pid=4500 auid=2000 uid=2000 gid=2000 euid=2000 suid=2000 fsuid=2000 egid=2000 sgid=2000 fsgid=2000 tty=pts1 ses=17 comm="git" exe="/usr/bin/git" subj=unconfined key=6F746865722D6B6579016167656E742D65786563
+type=EXECVE msg=audit(1793136000.800:509): argc=2 a0="git" a1="status"
+type=CWD msg=audit(1793136000.800:509): cwd="/home/agent/project"
+type=EOE msg=audit(1793136000.800:509): 

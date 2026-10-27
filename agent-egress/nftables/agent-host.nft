@@ -1,0 +1,45 @@
+#!/usr/sbin/nft -f
+# agent-host.nft — Restrict network egress of host processes owned by the
+# agent user (layer 1; docs/design/implementation.md, "Host firewall:
+# agent_egress").
+#
+# The agent user may open TCP only to the egress proxy (127.0.0.1:3128), the
+# optional OTLP receiver (127.0.0.1:4318), and a loopback dev-port range.
+# Everything else it sends is logged (rate-limited) and dropped: direct
+# internet traffic, all UDP (DNS, QUIC), ICMP, other host addresses, other
+# loopback ports, and IPv6 except ::1 on dev ports.  Other users are
+# unaffected.
+#
+# Template: install-host.sh fills in the agent UID (numeric, so the file also
+# parses on machines without an agent user) and the dev-port range.
+#
+# Loaded by agent-egress-nft.service.  The first two lines create the table
+# if missing and then delete it, so reloading replaces only our table
+# (never `flush ruleset`, which would also wipe libvirt's rules).
+
+table inet agent_egress
+delete table inet agent_egress
+
+table inet agent_egress {
+	set dev_ports {
+		type inet_service
+		flags interval
+		elements = { @DEV_PORTS@ }
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+		meta skuid @AGENT_UID@ jump agent_out
+	}
+
+	chain agent_out {
+		# Replies on loopback, e.g. an agent dev server answering the admin's
+		# browser.  Replies leaving through real interfaces are dropped.
+		oifname "lo" ct state established,related accept
+		ip daddr 127.0.0.1 tcp dport { 3128, 4318 } accept
+		ip daddr 127.0.0.1 tcp dport @dev_ports accept
+		ip6 daddr ::1 tcp dport @dev_ports accept
+		limit rate 10/second log prefix "agent-egress-drop " flags skuid
+		counter drop
+	}
+}

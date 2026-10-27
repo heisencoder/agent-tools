@@ -1,0 +1,97 @@
+{
+ "resourceMetrics": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "claude-code"
+      }
+     },
+     {
+      "key": "service.version",
+      "value": {
+       "stringValue": "2.1.300"
+      }
+     }
+    ]
+   },
+   "scopeMetrics": [
+    {
+     "scope": {
+      "name": "com.anthropic.claude_code"
+     },
+     "metrics": [
+      {
+       "name": "claude_code.token.usage",
+       "unit": "tokens",
+       "sum": {
+        "aggregationTemporality": 1,
+        "isMonotonic": true,
+        "dataPoints": [
+         {
+          "timeUnixNano": "1793136002000000000",
+          "asInt": "1200",
+          "attributes": [
+           {
+            "key": "session.id",
+            "value": {
+             "stringValue": "sess-1111"
+            }
+           },
+           {
+            "key": "type",
+            "value": {
+             "stringValue": "input"
+            }
+           }
+          ]
+         },
+         {
+          "timeUnixNano": "1793136002000000000",
+          "asInt": "340",
+          "attributes": [
+           {
+            "key": "session.id",
+            "value": {
+             "stringValue": "sess-1111"
+            }
+           },
+           {
+            "key": "type",
+            "value": {
+             "stringValue": "output"
+            }
+           }
+          ]
+         }
+        ]
+       }
+      },
+      {
+       "name": "claude_code.cost.usage",
+       "unit": "USD",
+       "sum": {
+        "dataPoints": [
+         {
+          "timeUnixNano": "1793136002000000000",
+          "asDouble": 0.0123,
+          "attributes": [
+           {
+            "key": "session.id",
+            "value": {
+             "stringValue": "sess-1111"
+            }
+           }
+          ]
+         }
+        ]
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

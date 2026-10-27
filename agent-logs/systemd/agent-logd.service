@@ -1,0 +1,37 @@
+# agent-logd: receive agent audit records and store them (host only).
+# See docs/design/implementation.md, "agent-logd".  Listening sockets come from
+# agent-logd-vsock.socket, agent-logd-unix.socket and (optionally)
+# agent-logd-otlp.socket; FileDescriptorName= tells them apart.
+
+[Unit]
+Description=Agent audit log receiver and store
+After=local-fs.target
+Wants=agent-logd-unix.socket agent-logd-vsock.socket
+After=agent-logd-unix.socket agent-logd-vsock.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/agent-logs/agent-logd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+
+User=agent-logd
+Group=agent-logd
+UMask=0027
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_VSOCK AF_INET AF_INET6
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/log/agent-audit
+LogRateLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

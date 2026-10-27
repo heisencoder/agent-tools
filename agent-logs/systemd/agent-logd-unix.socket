@@ -1,0 +1,17 @@
+# The host's own shipper connects here.  Root-only (agent-logd also checks
+# SO_PEERCRED uid 0).
+
+[Unit]
+Description=agent-logd unix ingest socket
+
+[Socket]
+ListenStream=/run/agent-logd/ingest.sock
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+DirectoryMode=0755
+FileDescriptorName=unix
+Service=agent-logd.service
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,13 @@
+# /etc/agent-tools/envs.conf — registry of VM agent environments (host only).
+#
+# Read by agent-egress-proxy (IP -> name), agent-logd (vsock CID -> name and
+# OTLP source IP -> name), and agent-egress/install-host.sh (static DHCP
+# leases).  See docs/design/implementation.md, "Environment registry: envs.conf".
+#
+# Format: one environment per line, a name followed by key=value fields.
+# Blank lines and text after '#' are ignored.  Names must match
+# [a-z0-9][a-z0-9-]*.  The host environment is always "host" and is not
+# listed here.
+#
+# name          vsock CID   IP on agent-net    MAC
+agent-vm1    cid=10      ip=192.168.123.10  mac=52:54:00:a9:00:10

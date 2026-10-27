@@ -1,0 +1,15 @@
+{
+  "env": {
+    "HTTPS_PROXY": "http://@PROXY@:3128",
+    "HTTP_PROXY": "http://@PROXY@:3128",
+    "https_proxy": "http://@PROXY@:3128",
+    "http_proxy": "http://@PROXY@:3128",
+    "NO_PROXY": "localhost,127.0.0.1,::1,@PROXY@",
+    "no_proxy": "localhost,127.0.0.1,::1,@PROXY@",
+    "CLAUDE_CODE_PROXY_RESOLVES_HOSTS": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "url.https://github.com/.insteadOf",
+    "GIT_CONFIG_VALUE_0": "git@github.com:"
+  }
+}

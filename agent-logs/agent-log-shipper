@@ -1,0 +1,1722 @@
+#!/usr/bin/python3 -I
+# agent-log-shipper — hook collector and log shipper for one agent environment.
+#
+# Runs as root (systemd unit agent-log-shipper.service) in every agent
+# environment: on the host and inside each agent VM.  See
+# docs/design/implementation.md, "Hook collector" and "Log shipper".
+#
+# Threads, each with its own cursor so one stuck source cannot stall the rest:
+#
+#   collector   /run/agent-log-shipper/hook.sock (mode 0666).  Each hook sends
+#               one frame (4-byte big-endian length + JSON).  The collector
+#               adds an "observed" object from SO_PEERCRED and /proc, appends
+#               {ts, boot_id, observed, event} to the spool, fsyncs, and only
+#               then replies "ok".  A single writer thread does all appends.
+#   audit-health  every 60 s compares free space under /var/log/audit with
+#               auditd's admin_space_left; while below it, the file
+#               /run/agent-log-shipper/audit-degraded exists (agent-run
+#               refuses to start) and a "meta audit-degraded" record is
+#               written.
+#
+# and, unless --mode local (phase 1: keep records on this machine only):
+#
+#   hook        reads the spool segments by byte offset
+#   journal     `journalctl --all -o json --follow` filtered to the proxy's
+#               decisions, kernel drop logs, journald suppression notices,
+#               and the pipeline's own logs
+#   audit       tails /var/log/audit/audit.log across rotations and groups
+#               lines into events
+#   transcript  polls ~agent/.claude/projects/**/*.jsonl and transcript paths
+#               seen in hook records, reading them defensively
+#   sender      batches records from all sources to agent-logd (unix socket
+#               on the host, vsock CID 2 port 700 from a privileged source
+#               port in a VM) and persists cursors only after the ack
+#
+# Usage:
+#   agent-log-shipper --mode host|vm|local [OPTIONS]
+#   (see --help; options other than --mode exist for tests and development)
+#
+# Standard library only; Python >= 3.12.
+
+import argparse
+import errno
+import hashlib
+import json
+import os
+import pwd
+import queue
+import random
+import re
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+import traceback
+
+# -----------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------
+
+HOOK_SOCKET = "/run/agent-log-shipper/hook.sock"
+RUNTIME_DIR = "/run/agent-log-shipper"
+STATE_DIR = "/var/lib/agent-log-shipper"
+LOGD_UNIX = "/run/agent-logd/ingest.sock"
+LOGD_CID = 2                     # the host, seen from a VM
+LOGD_PORT = 700
+VSOCK_SOURCE_PORTS = (600, 1023)  # binding these needs CAP_NET_BIND_SERVICE
+ENVS_CONF = "/etc/agent-tools/envs.conf"
+AUDIT_LOG = "/var/log/audit/audit.log"
+AUDITD_CONF = "/etc/audit/auditd.conf"
+
+HOOK_FRAME_MAX = 1 << 20         # largest hook record body we accept
+SEGMENT_SIZE = 64 << 20          # spool segment size
+SPOOL_CAP = 1 << 30              # total spool cap
+LOCAL_PRUNE_AT = 0.9             # local mode: prune oldest segment above this
+MAX_HOOK_CLIENTS = 64            # concurrent hook connections being served
+
+# A hook's "claude_pid" is its nearest ancestor whose executable basename is
+# NOT one of these.  Adjust here if Claude Code's hook spawning changes.
+SHELLS = frozenset({"sh", "dash", "bash", "zsh"})
+# Loader-injection variables reported in observed.loader_env (any LD_* too).
+LOADER_ENV_NAMES = frozenset({"BASH_ENV", "ENV", "GCONV_PATH"})
+
+# auditd keys we forward, mapped to the envelope "event" name.
+AUDIT_KEYS = {
+    "agent-exec": "exec",
+    "agent-socket": "socket",
+    "agent-secret-read": "secret-read",
+    "agent-policy": "policy",
+}
+# Record types forwarded even without a key (kernel emits them on changes to
+# firewall or audit rules).
+AUDIT_ALWAYS = {"NETFILTER_CFG": "netfilter-cfg", "CONFIG_CHANGE": "config-change"}
+AUDIT_GROUP_IDLE = 2.0           # seconds without a line before a group is done
+ARG_MAX_EACH = 16 << 10          # per-argument cap, UTF-8 bytes
+ARG_MAX_TOTAL = 512 << 10        # cap on all arguments of one exec
+AUDIT_LINE_MAX = 1 << 20
+
+TRANSCRIPT_POLL = 2.0
+TRANSCRIPT_LINE_MAX = 1 << 20
+TRANSCRIPT_READ_BUDGET = 16 << 20  # per file per poll, to stay fair
+
+JOURNAL_SUPPRESSED_ID = "a596d6fe7bfa4994828e72309e95d61e"
+DROP_PREFIXES = ("agent-egress-drop ", "agent-vmnet-drop ", "agent-vmnet-fwd-drop ")
+PROXY_UNIT = "agent-egress-proxy.service"
+SHIPPER_UNIT = "agent-log-shipper.service"
+LOGD_UNIT = "agent-logd.service"
+
+QUEUE_MAX = 1000                 # records buffered per source before blocking
+BATCH_MAX_RECORDS = 500
+BATCH_MAX_BYTES = 4 << 20
+ACK_TIMEOUT = 60.0
+
+NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
+
+
+# -----------------------------------------------------------------
+# Small helpers
+# -----------------------------------------------------------------
+
+def log(msg, level=6):
+    """Log one line to stderr; journald reads the <N> syslog priority prefix."""
+    for line in str(msg).splitlines() or [""]:
+        print(f"<{level}>{line}", file=sys.stderr, flush=True)
+
+
+def log_err(msg):
+    log(msg, 3)
+
+
+def utc_iso(t):
+    """Epoch seconds -> '2026-10-27T18:04:11.532Z'."""
+    ms = int(round(t * 1000))
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms // 1000)) + ".%03dZ" % (ms % 1000)
+
+
+def now_iso():
+    return utc_iso(time.time())
+
+
+def read_boot_id(proc_root="/proc"):
+    try:
+        with open(f"{proc_root}/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def read_btime(proc_root="/proc"):
+    """Boot time in epoch seconds, from /proc/stat."""
+    try:
+        with open(f"{proc_root}/stat") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return 0
+
+
+def encode_json(obj):
+    """Compact UTF-8 JSON; falls back to ASCII escapes for lone surrogates."""
+    try:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(obj, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def as_str(v):
+    return v if isinstance(v, str) else None
+
+
+def as_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def uid_of(user):
+    try:
+        return pwd.getpwnam(user).pw_uid
+    except KeyError:
+        return None
+
+
+def parse_envs_conf(path):
+    """Parse /etc/agent-tools/envs.conf into [{"name", "cid", "ip", "mac"}].
+    A missing file is an empty registry; a malformed one raises ValueError.
+    (The same small parser is duplicated in agent-logd.)"""
+    envs = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return envs
+    for lineno, line in enumerate(text.splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        name, *fields = line.split()
+        if not NAME_RE.match(name) or name == "host":
+            raise ValueError(f"{path}:{lineno}: bad environment name {name!r}")
+        entry = {"name": name}
+        for field in fields:
+            key, sep, value = field.partition("=")
+            if not sep:
+                raise ValueError(f"{path}:{lineno}: expected key=value, got {field!r}")
+            entry[key] = value
+        if "cid" in entry:
+            entry["cid"] = int(entry["cid"])
+        envs.append(entry)
+    return envs
+
+
+def envelope(source, source_id, event, ts, data, boot_id, **fields):
+    """A record in the common envelope (docs/design/implementation.md,
+    "Envelope schema").  agent-logd adds env and recv_ts.  source/source_id
+    come before data so agent-logd can still name an oversize record from
+    its first bytes."""
+    rec = {"ts": ts, "client_env": None, "boot_id": boot_id,
+           "source": source, "source_id": source_id,
+           "run_id": None, "session_id": None, "agent_id": None,
+           "uid": None, "auid": None, "ses": None, "pid": None,
+           "event": event}
+    rec.update(fields)
+    rec["data"] = data
+    return rec
+
+
+# -----------------------------------------------------------------
+# Persistent state: /var/lib/agent-log-shipper/state.json (mode 0600)
+# -----------------------------------------------------------------
+
+class State:
+    """A small JSON document written atomically (temp file, fsync, rename).
+    Holds the spool's segment counter and every source's acked cursor."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        try:
+            with open(path) as f:
+                self.data = json.load(f)
+            if not isinstance(self.data, dict):
+                raise ValueError("not an object")
+        except FileNotFoundError:
+            self.data = {}
+        except ValueError as e:
+            # Keep the broken file for inspection; the spool counter is
+            # recovered from segment names, cursors restart (duplicates are
+            # removed at query time).
+            aside = f"{path}.corrupt-{int(time.time())}"
+            log_err(f"state file {path} unreadable ({e}); moved to {aside}")
+            os.replace(path, aside)
+            self.data = {}
+
+    def get(self, key, default=None):
+        with self.lock:
+            return json.loads(json.dumps(self.data.get(key, default)))
+
+    def update(self, **kv):
+        with self.lock:
+            self.data.update(kv)
+            tmp = self.path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
+            try:
+                os.write(fd, encode_json(self.data))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, self.path)
+            fsync_dir(os.path.dirname(self.path) or ".")
+
+
+# -----------------------------------------------------------------
+# Spool: segmented append-only files of hook records
+# -----------------------------------------------------------------
+
+class SpoolFull(Exception):
+    pass
+
+
+SEGMENT_RE = re.compile(r"hook-(\d+)\.jsonl\Z")
+
+
+class Spool:
+    """spool/hook-<seq>.jsonl segments.  seq comes from state.json and never
+    resets, so "<seq>:<offset>" identifies a record for the life of the
+    environment.  write() appends without fsync; sync() makes everything
+    written so far durable (the writer thread groups commits)."""
+
+    def __init__(self, directory, state, segment_size=SEGMENT_SIZE, cap=SPOOL_CAP,
+                 local=False, fsync=os.fsync):
+        self.dir = directory
+        self.state = state
+        self.segment_size = segment_size
+        self.cap = cap
+        self.local = local
+        self.fsync = fsync
+        self.lock = threading.Lock()
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        segs = self.segments()
+        self.total = sum(self._size(s) for s in segs)
+        self.seq = max([self.state.get("hook_seq", 0)] + segs)
+        self.fd = None
+        self.cur_size = 0
+        self.dirty = []          # fds written since the last sync
+        self.broken = None       # error that makes the next sync fail
+        if segs and segs[-1] == self.seq:
+            self._reopen_last()
+
+    def path(self, seq):
+        return os.path.join(self.dir, f"hook-{seq:010d}.jsonl")
+
+    def segments(self):
+        """Sorted list of existing segment numbers."""
+        out = []
+        for name in os.listdir(self.dir):
+            m = SEGMENT_RE.match(name)
+            if m:
+                out.append(int(m.group(1)))
+        return sorted(out)
+
+    def _size(self, seq):
+        try:
+            return os.stat(self.path(seq)).st_size
+        except FileNotFoundError:
+            return 0
+
+    def _reopen_last(self):
+        """Continue appending to the newest segment, dropping a torn last
+        line left by a crash (it was never acked to the hook)."""
+        fd = os.open(self.path(self.seq), os.O_RDWR | os.O_APPEND | os.O_CLOEXEC)
+        size = os.fstat(fd).st_size
+        if size:
+            tail = os.pread(fd, min(size, HOOK_FRAME_MAX * 4), max(0, size - HOOK_FRAME_MAX * 4))
+            keep = size - len(tail) + tail.rfind(b"\n") + 1 if b"\n" in tail else size - len(tail)
+            if keep != size:
+                log_err(f"spool: dropping torn tail of {self.path(self.seq)} ({size - keep} bytes)")
+                os.ftruncate(fd, keep)
+                os.fsync(fd)
+                self.total -= size - keep
+                size = keep
+        self.fd = fd
+        self.cur_size = size
+
+    def _rotate(self):
+        if self.fd is not None:
+            try:
+                self.fsync(self.fd)
+            except OSError as e:
+                self.broken = e
+            os.close(self.fd)
+            self.dirty = [d for d in self.dirty if d != self.fd]
+            self.fd = None
+        # Persist the counter before creating the file, so a segment can
+        # never carry a number that state.json does not cover.
+        self.seq += 1
+        self.state.update(hook_seq=self.seq)
+        self.fd = os.open(self.path(self.seq),
+                          os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC, 0o600)
+        fsync_dir(self.dir)
+        self.cur_size = 0
+
+    def _prune(self, incoming):
+        """Local mode: delete oldest segments while over 90% of the cap."""
+        pruned = []
+        while self.total + incoming > self.cap * LOCAL_PRUNE_AT:
+            older = [s for s in self.segments() if s != self.seq]
+            if not older:
+                break
+            size = self._size(older[0])
+            os.unlink(self.path(older[0]))
+            self.total -= size
+            pruned.append({"seq": older[0], "bytes": size})
+        return pruned
+
+    def _write_raw(self, data):
+        if self.fd is None or (self.cur_size and self.cur_size + len(data) > self.segment_size):
+            self._rotate()
+        if self.total + len(data) > self.cap:
+            raise SpoolFull(f"spool cap {self.cap} bytes reached")
+        offset = self.cur_size
+        try:
+            n = os.write(self.fd, data)
+            if n != len(data):
+                raise OSError(errno.ENOSPC, "short write to spool")
+        except OSError:
+            try:
+                os.ftruncate(self.fd, offset)
+            except OSError:
+                pass
+            raise
+        self.cur_size += n
+        self.total += n
+        if self.fd not in self.dirty:
+            self.dirty.append(self.fd)
+        return f"{self.seq}:{offset}"
+
+    def write(self, obj):
+        """Append one record (not yet durable).  Returns its source_id."""
+        data = encode_json(obj) + b"\n"
+        with self.lock:
+            if self.local:
+                pruned = self._prune(len(data))
+                if pruned:
+                    meta = {"ts": now_iso(), "boot_id": obj.get("boot_id"),
+                            "meta": {"event": "spool-pruned", "segments": pruned}}
+                    log_err(f"spool: local mode pruned {pruned}")
+                    self._write_raw(encode_json(meta) + b"\n")
+            return self._write_raw(data)
+
+    def sync(self):
+        with self.lock:
+            broken, self.broken = self.broken, None
+            fds, self.dirty = self.dirty, []
+            for fd in fds:
+                self.fsync(fd)
+            if broken:
+                raise broken
+
+    def delete_before(self, seq):
+        """Delete fully acked segments (all segments numbered below seq)."""
+        with self.lock:
+            for s in self.segments():
+                if s < seq and s != self.seq:
+                    size = self._size(s)
+                    try:
+                        os.unlink(self.path(s))
+                        self.total -= size
+                    except FileNotFoundError:
+                        pass
+
+
+# -----------------------------------------------------------------
+# Collector: /proc observation of the hook process
+# -----------------------------------------------------------------
+
+def _read_bytes(path, limit=1 << 20):
+    with open(path, "rb") as f:
+        return f.read(limit)
+
+
+def proc_stat(proc_root, pid):
+    """(ppid, start_time) from /proc/<pid>/stat.  comm may contain spaces
+    and parentheses, so split after the last ')'."""
+    raw = _read_bytes(f"{proc_root}/{pid}/stat").decode("utf-8", "replace")
+    rest = raw.rpartition(")")[2].split()
+    return int(rest[1]), int(rest[19])
+
+
+def proc_exe(proc_root, pid):
+    try:
+        return os.readlink(f"{proc_root}/{pid}/exe")
+    except OSError:
+        return None
+
+
+def proc_environ(proc_root, pid):
+    raw = _read_bytes(f"{proc_root}/{pid}/environ", 4 << 20)
+    env = {}
+    for item in raw.split(b"\0"):
+        if item:
+            key, _, value = item.decode("utf-8", "replace").partition("=")
+            env.setdefault(key, value)
+    return env
+
+
+def exe_basename(exe):
+    if not exe:
+        return ""
+    if exe.endswith(" (deleted)"):
+        exe = exe[: -len(" (deleted)")]
+    return os.path.basename(exe)
+
+
+def observe_process(pid, uid, gid, proc_root="/proc"):
+    """The collector's "observed" object for a hook process (see
+    implementation.md, "Hook collector").
+    Read while the hook is still blocked waiting for our reply."""
+    base = f"{proc_root}/{pid}"
+    obs = {"pid": pid, "uid": uid, "gid": gid, "exe": proc_exe(proc_root, pid),
+           "cmdline": None, "auid": None, "ses": None, "cgroup": None,
+           "ancestry": [], "claude_pid": None, "claude_exe": None,
+           "run_id": None, "loader_env": None, "errors": []}
+
+    def attempt(field, fn):
+        try:
+            obs[field] = fn()
+        except (OSError, ValueError, IndexError) as e:
+            obs["errors"].append(f"{field}: {e}")
+
+    attempt("cmdline", lambda: [a.decode("utf-8", "replace")
+                                for a in _read_bytes(f"{base}/cmdline").split(b"\0")[:-1]])
+    attempt("auid", lambda: int(_read_bytes(f"{base}/loginuid")))
+    attempt("ses", lambda: int(_read_bytes(f"{base}/sessionid")))
+    attempt("cgroup", lambda: _read_bytes(f"{base}/cgroup").decode("utf-8", "replace").strip())
+
+    # Walk PPid up to PID 1 (bounded, loop-safe).
+    p, seen = pid, set()
+    while p and p not in seen and len(seen) < 128:
+        seen.add(p)
+        try:
+            ppid, start = proc_stat(proc_root, p)
+        except (OSError, ValueError, IndexError) as e:
+            obs["errors"].append(f"ancestry {p}: {e}")
+            break
+        obs["ancestry"].append({"pid": p, "exe": proc_exe(proc_root, p), "start_time": start})
+        if p == 1:
+            break
+        p = ppid
+
+    for entry in obs["ancestry"][1:]:
+        if exe_basename(entry["exe"]) not in SHELLS:
+            obs["claude_pid"], obs["claude_exe"] = entry["pid"], entry["exe"]
+            break
+    if obs["claude_pid"]:
+        attempt("run_id", lambda: proc_environ(proc_root, obs["claude_pid"]).get("AGENT_RUN_ID"))
+    # Only non-empty values count: the managed settings pin these to "".
+    attempt("loader_env", lambda: {k: v for k, v in proc_environ(proc_root, pid).items()
+                                   if v and (k.startswith("LD_") or k in LOADER_ENV_NAMES)})
+    return obs
+
+
+def recv_exact(conn, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = conn.recv(min(n - len(buf), 1 << 20))
+        if not chunk:
+            raise EOFError("peer closed")
+        buf += chunk
+    return bytes(buf)
+
+
+class Collector:
+    """Hook collector: one Unix stream socket, one handler thread per hook
+    connection, one writer thread that owns the spool."""
+
+    def __init__(self, sock_path, spool, boot_id, proc_root="/proc", on_paths=None,
+                 reply_timeout=10.0):
+        self.sock_path = sock_path
+        self.spool = spool
+        self.boot_id = boot_id
+        self.proc_root = proc_root
+        self.on_paths = on_paths            # callback for transcript paths
+        self.reply_timeout = reply_timeout
+        self.queue = queue.Queue()
+        self.slots = threading.BoundedSemaphore(MAX_HOOK_CLIENTS)
+        self.wakeup = threading.Event()     # set after each durable write
+        self.sock = None
+
+    def start(self):
+        try:
+            os.unlink(self.sock_path)
+        except FileNotFoundError:
+            pass
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(self.sock_path)
+        os.chmod(self.sock_path, 0o666)     # every local user's hooks connect
+        self.sock.listen(128)
+        threading.Thread(target=self._writer, name="spool-writer", daemon=True).start()
+        threading.Thread(target=self._accept, name="collector", daemon=True).start()
+        log(f"collector listening on {self.sock_path}")
+
+    def submit(self, obj, wait=True):
+        """Queue a record for the writer.  With wait, return True only once
+        it is durable."""
+        item = {"obj": obj, "done": threading.Event(), "ok": False}
+        self.queue.put(item)
+        if not wait:
+            return None
+        item["done"].wait(self.reply_timeout)
+        return item["ok"]
+
+    def emit_meta(self, event, **data):
+        """Write a pipeline report into the spool (shipped as source=meta)."""
+        self.submit({"ts": now_iso(), "boot_id": self.boot_id,
+                     "meta": {"event": event, **data}}, wait=False)
+
+    def _writer(self):
+        while True:
+            items = [self.queue.get()]
+            while True:                      # group commit: one fsync per burst
+                try:
+                    items.append(self.queue.get_nowait())
+                except queue.Empty:
+                    break
+            written = []
+            for item in items:
+                try:
+                    self.spool.write(item["obj"])
+                    written.append(item)
+                except (OSError, SpoolFull) as e:
+                    log_err(f"collector: spool write failed: {e}")
+                    item["done"].set()
+            try:
+                self.spool.sync()
+                for item in written:
+                    item["ok"] = True
+            except OSError as e:
+                log_err(f"collector: spool fsync failed: {e}")
+            for item in written:
+                item["done"].set()
+            self.wakeup.set()
+
+    def _accept(self):
+        while True:
+            self.slots.acquire()
+            try:
+                conn, _ = self.sock.accept()
+            except OSError as e:
+                self.slots.release()
+                log_err(f"collector: accept failed: {e}")
+                time.sleep(0.1)
+                continue
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        try:
+            conn.settimeout(10)
+            pid, uid, gid = struct.unpack("3i", conn.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+            (length,) = struct.unpack(">I", recv_exact(conn, 4))
+            if not 0 < length <= HOOK_FRAME_MAX:
+                log_err(f"collector: pid {pid} uid {uid}: bad frame length {length}")
+                return
+            event = json.loads(recv_exact(conn, length).decode("utf-8"))
+            if not isinstance(event, dict):
+                log_err(f"collector: pid {pid} uid {uid}: frame is not a JSON object")
+                return
+            observed = observe_process(pid, uid, gid, self.proc_root)
+            record = {"ts": now_iso(), "boot_id": self.boot_id,
+                      "observed": observed, "event": event}
+            if self.submit(record):
+                conn.sendall(b"ok")
+                if self.on_paths:
+                    paths = [event.get(k) for k in ("transcript_path", "agent_transcript_path")]
+                    self.on_paths([p for p in paths if isinstance(p, str)])
+        except (OSError, EOFError, ValueError, RecursionError, struct.error) as e:
+            log_err(f"collector: connection failed: {e}")
+        finally:
+            conn.close()
+            self.slots.release()
+
+
+# -----------------------------------------------------------------
+# audit-degraded: free space on /var/log/audit vs admin_space_left
+# -----------------------------------------------------------------
+
+def parse_auditd_conf(path):
+    conf = {}
+    with open(path) as f:
+        for line in f:
+            line = line.split("#", 1)[0]
+            key, sep, value = line.partition("=")
+            if sep:
+                conf[key.strip()] = value.strip()
+    return conf
+
+
+class AuditHealth:
+    """Creates RUNTIME_DIR/audit-degraded while auditd would be suspended
+    (or cannot be checked), removes it on recovery, and reports each
+    transition as a meta record.  agent-run refuses to start while the flag
+    file exists."""
+
+    def __init__(self, conf_path, log_dir, flag_path, emit, interval=60.0,
+                 statvfs=os.statvfs):
+        self.conf_path = conf_path
+        self.log_dir = log_dir
+        self.flag_path = flag_path
+        self.emit = emit
+        self.interval = interval
+        self.statvfs = statvfs
+        self.degraded = None
+
+    def status(self):
+        try:
+            conf = parse_auditd_conf(self.conf_path)
+        except OSError as e:
+            return {"degraded": True, "reason": f"cannot read {self.conf_path}: {e.strerror}"}
+        try:
+            st = self.statvfs(self.log_dir)
+        except OSError as e:
+            return {"degraded": True, "reason": f"cannot stat {self.log_dir}: {e.strerror}"}
+        free = st.f_bavail * st.f_frsize
+        value = conf.get("admin_space_left", "50")       # auditd default: 50 MB
+        try:
+            if value.endswith("%"):
+                threshold = int(st.f_blocks * st.f_frsize * float(value[:-1]) / 100)
+            else:
+                threshold = int(value) * 1024 * 1024
+        except ValueError:
+            return {"degraded": True, "reason": f"bad admin_space_left {value!r}"}
+        status = {"degraded": free < threshold, "free_bytes": free,
+                  "threshold_bytes": threshold, "log_dir": self.log_dir}
+        if status["degraded"]:
+            status["reason"] = "free space below admin_space_left"
+        return status
+
+    def check_once(self):
+        status = self.status()
+        if status["degraded"]:
+            tmp = self.flag_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(dict(status, since=now_iso()), f)
+            os.chmod(tmp, 0o644)
+            if not os.path.exists(self.flag_path):
+                os.replace(tmp, self.flag_path)
+            else:
+                os.unlink(tmp)
+        else:
+            try:
+                os.unlink(self.flag_path)
+            except FileNotFoundError:
+                pass
+        if status["degraded"] != self.degraded:
+            if status["degraded"]:
+                log_err(f"audit-degraded: {status['reason']}")
+                self.emit("audit-degraded", **status)
+            elif self.degraded is not None:
+                log("audit space recovered")
+                self.emit("audit-recovered", **status)
+            self.degraded = status["degraded"]
+        return status
+
+    def run(self):
+        while True:
+            time.sleep(self.interval)
+            try:
+                self.check_once()
+            except Exception as e:     # keep checking whatever happens
+                log_err(f"audit-health: {e}")
+
+
+# -----------------------------------------------------------------
+# Sources (forwarding modes)
+# -----------------------------------------------------------------
+
+class Source:
+    """A reader thread that produces (record, cursor) pairs into a bounded
+    queue.  The sender calls apply_commit() with each acked cursor in order;
+    committed() is what goes into state.json."""
+
+    name = "source"
+
+    def __init__(self, state):
+        self.queue = queue.Queue(maxsize=QUEUE_MAX)
+        cursors = state.get("cursors", {}) or {}
+        self.cursor = cursors.get(self.name)
+
+    def put(self, record, cursor):
+        self.queue.put((record, cursor))
+
+    def apply_commit(self, cursor):
+        self.cursor = cursor
+
+    def committed(self):
+        return self.cursor
+
+    def after_commit(self):
+        pass
+
+    def start(self):
+        threading.Thread(target=self._loop, name=self.name, daemon=True).start()
+
+    def _loop(self):
+        delay = 1
+        while True:
+            try:
+                self.run()
+                delay = 1
+            except Exception:
+                log_err(f"{self.name}: {traceback.format_exc()}")
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
+    def run(self):
+        raise NotImplementedError
+
+
+# --- hook spool --------------------------------------------------------------
+
+def hook_envelope(obj, source_id):
+    """Spool line -> envelope.  Lines are {ts, boot_id, observed, event} or
+    the collector's own {ts, boot_id, meta}."""
+    boot_id = obj.get("boot_id")
+    if isinstance(obj.get("meta"), dict):
+        meta = obj["meta"]
+        return envelope("meta", source_id, as_str(meta.get("event")) or "meta",
+                        obj.get("ts"), meta, boot_id)
+    ev = obj.get("event") if isinstance(obj.get("event"), dict) else {}
+    obs = obj.get("observed") if isinstance(obj.get("observed"), dict) else {}
+    return envelope("hook", source_id, as_str(ev.get("hook_event_name")) or "hook",
+                    obj.get("ts"), {"observed": obs, "event": ev}, boot_id,
+                    run_id=as_str(obs.get("run_id")), session_id=as_str(ev.get("session_id")),
+                    agent_id=as_str(ev.get("agent_id")), uid=obs.get("uid"),
+                    auid=obs.get("auid"), ses=obs.get("ses"), pid=obs.get("pid"))
+
+
+class HookSpoolSource(Source):
+    """Reads spool segments by byte offset; deletes fully acked segments.
+    Cursor: [seq, offset] of the next unread byte."""
+
+    name = "hook"
+
+    def __init__(self, state, spool, wakeup):
+        super().__init__(state)
+        self.spool = spool
+        self.wakeup = wakeup
+
+    def after_commit(self):
+        if self.cursor:
+            self.spool.delete_before(self.cursor[0])
+
+    def run(self):
+        seq, off = self.cursor or (0, 0)
+        fd = None
+        try:
+            while True:
+                segs = self.spool.segments()
+                if not segs or seq > segs[-1]:
+                    self._wait()
+                    continue
+                if seq not in segs:          # pruned or never existed
+                    newer = [s for s in segs if s > seq]
+                    seq, off = newer[0], 0
+                    if fd is not None:
+                        os.close(fd)
+                        fd = None
+                if fd is None:
+                    fd = os.open(self.spool.path(seq), os.O_RDONLY | os.O_CLOEXEC)
+                # Decide "is this segment finished?" before reading it to EOF.
+                finished = segs[-1] > seq
+                chunk = os.pread(fd, 4 << 20, off)
+                end = chunk.rfind(b"\n") + 1
+                if end:
+                    pos = 0
+                    for line in chunk[:end].split(b"\n")[:-1]:
+                        line_off = off + pos
+                        pos += len(line) + 1
+                        try:
+                            obj = json.loads(line)
+                        except ValueError:
+                            log_err(f"hook: bad spool line {seq}:{line_off}")
+                            continue
+                        self.put(hook_envelope(obj, f"{seq}:{line_off}"), [seq, off + pos])
+                    off += end
+                elif finished:
+                    if chunk:
+                        log_err(f"hook: ignoring torn tail of segment {seq}")
+                    os.close(fd)
+                    fd = None
+                    seq, off = seq + 1, 0
+                else:
+                    self._wait()
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _wait(self):
+        self.wakeup.wait(0.5)
+        self.wakeup.clear()
+
+
+# --- journald ----------------------------------------------------------------
+
+def journal_message(entry):
+    """MESSAGE is a string, or an array of byte values if not valid UTF-8."""
+    msg = entry.get("MESSAGE")
+    if isinstance(msg, list):
+        try:
+            return bytes(msg).decode("utf-8", "replace")
+        except (TypeError, ValueError):
+            return None
+    return msg if isinstance(msg, str) else None
+
+
+def parse_nft_log(message):
+    """'agent-vmnet-drop IN=virbr-agent OUT= SRC=… DPT=53 …' -> fields."""
+    prefix, _, rest = message.partition(" ")
+    fields, flags = {}, []
+    for tok in rest.split():
+        key, sep, value = tok.partition("=")
+        if sep:
+            fields[key.lower()] = value
+        else:
+            flags.append(tok)
+    return {"prefix": prefix, "fields": fields, "flags": flags, "message": message}
+
+
+def journalctl_args(journalctl, cursor, egress_uid, logd_uid):
+    """journalctl command line.  Matches on different fields are AND-ed,
+    groups separated by "+" are OR-ed.  The kernel MESSAGE prefix is checked
+    after reading."""
+    args = [journalctl, "--all", "-o", "json", "--follow", "--no-pager"]
+    args.append(f"--after-cursor={cursor}" if cursor else "--boot")
+    groups = []
+    if egress_uid is not None:
+        groups.append([f"_SYSTEMD_UNIT={PROXY_UNIT}", f"_UID={egress_uid}"])
+    groups.append(["_TRANSPORT=kernel"])
+    groups.append([f"MESSAGE_ID={JOURNAL_SUPPRESSED_ID}"])
+    groups.append([f"_SYSTEMD_UNIT={SHIPPER_UNIT}", "_UID=0"])
+    if logd_uid is not None:
+        groups.append([f"_SYSTEMD_UNIT={LOGD_UNIT}", f"_UID={logd_uid}"])
+    for i, group in enumerate(groups):
+        if i:
+            args.append("+")
+        args += group
+    return args
+
+
+def classify_journal(entry, egress_uid, logd_uid, env_by_ip):
+    """One journald JSON entry -> envelope, or None if it is not ours.
+    Trusted fields (_UID, _SYSTEMD_UNIT, _TRANSPORT) are re-checked here so a
+    stray match can never turn a forged message into a proxy record."""
+    cursor = entry.get("__CURSOR")
+    if not isinstance(cursor, str):
+        return None
+    unit = entry.get("_SYSTEMD_UNIT")
+    uid = as_int(entry.get("_UID"))
+    msg = journal_message(entry)
+    try:
+        ts = utc_iso(int(entry["__REALTIME_TIMESTAMP"]) / 1e6)
+    except (KeyError, TypeError, ValueError):
+        ts = now_iso()
+    common = {"pid": as_int(entry.get("_PID")), "uid": uid}
+    boot_id = entry.get("_BOOT_ID")
+
+    if unit == PROXY_UNIT and egress_uid is not None and uid == egress_uid:
+        try:
+            decision = json.loads(msg or "")
+        except ValueError:
+            decision = None
+        if isinstance(decision, dict):
+            # The proxy logs at connection close; its "ts" is the start time.
+            ts = as_str(decision.get("ts")) or ts
+            return envelope("egress", cursor, "connect", ts, decision, boot_id,
+                            client_env=as_str(decision.get("env")), **common)
+        return envelope("meta", cursor, "proxy-log", ts,
+                        {"unit": unit, "message": msg, "priority": entry.get("PRIORITY")},
+                        boot_id, **common)
+
+    if entry.get("_TRANSPORT") == "kernel" and msg and msg.startswith(DROP_PREFIXES):
+        data = parse_nft_log(msg)
+        client_env = None
+        if data["prefix"] == "agent-egress-drop":
+            client_env = "host"          # the host-only agent_egress table
+        else:
+            client_env = env_by_ip.get(data["fields"].get("src"))
+        fields = dict(common, uid=as_int(data["fields"].get("uid")))
+        return envelope("netfilter", cursor, "drop", ts, data, boot_id,
+                        client_env=client_env, **fields)
+
+    if entry.get("MESSAGE_ID") == JOURNAL_SUPPRESSED_ID:
+        return envelope("meta", cursor, "journal-suppressed", ts,
+                        {"message": msg, "unit": entry.get("UNIT") or unit}, boot_id, **common)
+
+    if (unit == SHIPPER_UNIT and uid == 0) or (unit == LOGD_UNIT and logd_uid is not None
+                                               and uid == logd_uid):
+        return envelope("meta", cursor, "pipeline-log", ts,
+                        {"unit": unit, "message": msg, "priority": as_int(entry.get("PRIORITY"))},
+                        boot_id, **common)
+    return None
+
+
+class JournalSource(Source):
+    """Runs journalctl as a subprocess and classifies its JSON lines.
+    Cursor: the journald cursor of the last acked entry."""
+
+    name = "journal"
+
+    def __init__(self, state, journalctl, egress_uid, logd_uid, envs_conf):
+        super().__init__(state)
+        self.journalctl = journalctl
+        self.egress_uid = egress_uid
+        self.logd_uid = logd_uid
+        self.envs_conf = envs_conf
+        self.read_cursor = self.cursor     # last entry read (acked or not)
+
+    def env_by_ip(self):
+        try:
+            return {e["ip"]: e["name"] for e in parse_envs_conf(self.envs_conf) if "ip" in e}
+        except (OSError, ValueError) as e:
+            log_err(f"journal: {e}")
+            return {}
+
+    def run(self):
+        env_by_ip = self.env_by_ip()
+        args = journalctl_args(self.journalctl, self.read_cursor, self.egress_uid, self.logd_uid)
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+        try:
+            for line in proc.stdout:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                rec = classify_journal(entry, self.egress_uid, self.logd_uid, env_by_ip)
+                if isinstance(entry.get("__CURSOR"), str):
+                    self.read_cursor = entry["__CURSOR"]
+                if rec:
+                    self.put(rec, rec["source_id"])
+        finally:
+            proc.kill()
+            proc.wait()
+        raise RuntimeError(f"journalctl exited with status {proc.returncode}")
+
+
+# --- auditd ------------------------------------------------------------------
+
+AUDIT_LINE_RE = re.compile(r"type=(\S+) msg=audit\((\d+\.\d+):(\d+)\):\s?(.*)\Z", re.S)
+AUDIT_FIELD_RE = re.compile(r"""([\w\[\]-]+)=("[^"]*"|'[^']*'|\S*)""")
+HEX_RE = re.compile(r"(?:[0-9A-Fa-f]{2})+\Z")
+# Fields auditd hex-encodes (unquoted) when they contain special characters.
+AUDIT_STRING_FIELDS = re.compile(r"(?:a\d+(?:\[\d+\])?|exe|comm|cwd|name|proctitle|key|cmd)\Z")
+AUDIT_INT_FIELDS = ("pid", "ppid", "auid", "ses", "uid", "euid", "gid", "egid", "exit", "syscall")
+
+
+def parse_audit_fields(text):
+    """'a=1 b="x y" c=2F746D70' -> {"a": "1", "b": "x y", "c": "/tmp"}.
+    Unquoted string-typed values are hex; "(null)" stays as is."""
+    text = text.split("\x1d", 1)[0]        # drop log_format=ENRICHED suffix
+    fields = {}
+    for key, value in AUDIT_FIELD_RE.findall(text):
+        if value[:1] in "\"'" and len(value) >= 2 and value[-1] == value[0]:
+            value = value[1:-1]
+        elif AUDIT_STRING_FIELDS.match(key) and HEX_RE.match(value):
+            value = bytes.fromhex(value).decode("utf-8", "replace")
+        fields.setdefault(key, value)
+    return fields
+
+
+def parse_audit_line(line):
+    """-> (type, time_str, serial_str, fields_text) or None."""
+    m = AUDIT_LINE_RE.match(line)
+    return m.groups() if m else None
+
+
+def truncate_args(args):
+    """Cap each argument at ARG_MAX_EACH and all of them at ARG_MAX_TOTAL
+    (UTF-8 bytes); record original length and SHA-256 of each cut one."""
+    out, truncated, budget = [], {}, ARG_MAX_TOTAL
+    for i, arg in enumerate(args):
+        raw = arg.encode("utf-8", "replace")
+        keep = min(len(raw), ARG_MAX_EACH, budget)
+        if keep < len(raw):
+            truncated[str(i)] = {"length": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+            arg = raw[:keep].decode("utf-8", "ignore")
+        budget -= keep
+        out.append(arg)
+    return out, truncated
+
+
+def build_audit_event(lines):
+    """A complete group of audit lines -> (event, data) or None if the
+    group is not one we forward."""
+    records = []
+    for line in lines:
+        parsed = parse_audit_line(line)
+        if parsed:
+            records.append((parsed[0], parse_audit_fields(parsed[3])))
+    types = [t for t, _ in records]
+    key = None
+    for t, f in records:
+        k = f.get("key")
+        if k and k != "(null)":
+            # A rule with several keys joins them with \x01.
+            for part in k.split("\x01"):
+                if part in AUDIT_KEYS:
+                    key = part
+                    break
+        if key:
+            break
+    event = AUDIT_KEYS.get(key)
+    if event is None:
+        event = next((AUDIT_ALWAYS[t] for t in types if t in AUDIT_ALWAYS), None)
+    if event is None:
+        return None
+
+    data = {"key": key, "types": types, "pid": None, "ppid": None, "auid": None, "ses": None,
+            "uid": None, "exe": None, "comm": None, "argv": [], "cwd": None, "success": None}
+    pieces = {}            # argument index -> list of (part, text)
+    argc = 0
+    paths, extra = [], []
+    for t, f in records:
+        if t == "SYSCALL":
+            for k in AUDIT_INT_FIELDS:
+                if k in f:
+                    data[k] = as_int(f[k])
+            data["exe"], data["comm"] = f.get("exe"), f.get("comm")
+            data["success"] = {"yes": True, "no": False}.get(f.get("success"))
+            data["arch"] = f.get("arch")
+        elif t == "EXECVE":
+            argc = max(argc, as_int(f.get("argc")) or 0)
+            for k, v in f.items():
+                m = re.match(r"a(\d+)(?:\[(\d+)\])?\Z", k)
+                if m:
+                    pieces.setdefault(int(m.group(1)), []).append((int(m.group(2) or 0), v))
+        elif t == "CWD":
+            data["cwd"] = f.get("cwd")
+        elif t == "PATH":
+            paths.append({k: f.get(k) for k in ("item", "name", "nametype", "inode", "mode", "ouid")})
+        elif t == "PROCTITLE":
+            title = f.get("proctitle", "")
+            data["proctitle"] = title.replace("\0", " ")[:ARG_MAX_EACH]
+        elif t != "EOE":
+            extra.append(dict(f, type=t))
+    args = ["".join(text for _, text in sorted(pieces.get(i, []))) for i in range(argc)]
+    data["argv"], argv_truncated = truncate_args(args)
+    if argv_truncated:
+        data["argv_truncated"] = argv_truncated
+    if paths:
+        data["paths"] = paths
+    if extra:
+        data["records"] = extra
+    return event, data
+
+
+class AuditGrouper:
+    """Groups audit.log lines by msg=audit(<time>:<serial>).  A group is
+    complete at its EOE line, after AUDIT_GROUP_IDLE seconds with no new
+    line, or at the end of a rotated file.  Events can interleave."""
+
+    def __init__(self, idle=AUDIT_GROUP_IDLE):
+        self.idle = idle
+        self.pending = {}     # (time, serial) -> {"lines", "first", "last"}
+
+    def feed(self, line, offset, now):
+        parsed = parse_audit_line(line)
+        if not parsed:
+            return []
+        rtype, tstr, serial, _ = parsed
+        key = (tstr, serial)
+        group = self.pending.setdefault(key, {"lines": [], "first": offset, "last": now})
+        group["lines"].append(line)
+        group["last"] = now
+        if rtype == "EOE":
+            del self.pending[key]
+            return [(key, group)]
+        return []
+
+    def expire(self, now):
+        done = [(k, g) for k, g in self.pending.items() if now - g["last"] >= self.idle]
+        for k, _ in done:
+            del self.pending[k]
+        return done
+
+    def flush(self):
+        done = sorted(self.pending.items(), key=lambda kv: kv[1]["first"])
+        self.pending = {}
+        return done
+
+    def min_offset(self, default):
+        return min([g["first"] for g in self.pending.values()] + [default])
+
+
+class AuditSource(Source):
+    """Tails audit.log following rotation (inode + offset).  Cursor:
+    {"inode", "offset", "boot_id"}.  The offset never passes the first line
+    of a still-incomplete group, so a restart re-reads it (duplicates are
+    removed at query time)."""
+
+    name = "audit"
+
+    def __init__(self, state, path, boot_id, btime, clock=time.monotonic, poll=0.25,
+                 idle=AUDIT_GROUP_IDLE):
+        super().__init__(state)
+        self.path = path
+        self.boot_id = boot_id
+        self.btime = btime
+        self.clock = clock
+        self.poll = poll
+        self.idle = idle
+        prev = (self.cursor or {}).get("boot_id")
+        self.prev_boot_id = prev if prev and prev != boot_id else None
+
+    def boot_id_for(self, t):
+        """Lines written before this boot belong to the previous one (serial
+        numbers restart at each boot)."""
+        if self.prev_boot_id and t < self.btime:
+            return self.prev_boot_id
+        return self.boot_id
+
+    def record_for(self, key, group):
+        built = build_audit_event(group["lines"])
+        if not built:
+            return None
+        event, data = built
+        tstr, serial = key
+        t = float(tstr)
+        boot_id = self.boot_id_for(t)
+        return envelope("audit", f"{boot_id}:{tstr}:{serial}", event, utc_iso(t), data, boot_id,
+                        uid=data.get("uid"), auid=data.get("auid"), ses=data.get("ses"),
+                        pid=data.get("pid"))
+
+    def files_in_order(self):
+        """Rotated files oldest first (audit.log.N … audit.log.1), then the
+        live file: [(path, inode)]."""
+        rotated = []
+        directory, base = os.path.split(self.path)
+        for name in os.listdir(directory or "."):
+            m = re.match(re.escape(base) + r"\.(\d+)\Z", name)
+            if m:
+                rotated.append((int(m.group(1)), os.path.join(directory, name)))
+        out = []
+        for _, p in sorted(rotated, reverse=True) + [(0, self.path)]:
+            try:
+                out.append((p, os.stat(p).st_ino))
+            except FileNotFoundError:
+                pass
+        return out
+
+    def run(self):
+        cur = self.cursor or {}
+        files = self.files_in_order()
+        live = files.pop() if files and files[-1][0] == self.path else None
+        offset, backlog = 0, []
+        if cur.get("inode") is not None:
+            if live and live[1] == cur["inode"]:
+                offset = cur.get("offset", 0)
+            else:
+                idx = [i for i, (_, ino) in enumerate(files) if ino == cur["inode"]]
+                if idx:
+                    backlog = files[idx[-1]:]     # cursor file and newer rotations
+                else:
+                    log_err(f"audit: cursor file (inode {cur['inode']}) is gone; "
+                            f"reading {self.path} from the start")
+                    self.put(envelope("meta", f"audit-cursor-lost:{cur['inode']}:{self.boot_id}",
+                                      "audit-cursor-lost", now_iso(), {"cursor": cur},
+                                      self.boot_id), None)
+        # Finish rotated files first, completing their groups at EOF.
+        for n, (path, inode) in enumerate(backlog):
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                self._consume(fd, inode, cur.get("offset", 0) if n == 0 else 0, rotated=True)
+            finally:
+                os.close(fd)
+        while not os.path.exists(self.path):
+            time.sleep(self.poll * 4)
+        while True:
+            fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                inode = os.fstat(fd).st_ino
+                self._consume(fd, inode, offset, rotated=False)
+            finally:
+                os.close(fd)
+            offset = 0
+
+    def _consume(self, fd, inode, offset, rotated):
+        """Read fd from offset.  For a rotated file stop at EOF; for the live
+        file, return once it has been rotated away (after draining it)."""
+        grouper = AuditGrouper(self.idle)
+        buf, buf_off = b"", offset
+
+        def emit(done, consumed):
+            for key, group in done:
+                rec = self.record_for(key, group)
+                if rec:
+                    cursor = {"inode": inode, "offset": grouper.min_offset(consumed),
+                              "boot_id": self.boot_id}
+                    self.put(rec, cursor)
+
+        while True:
+            chunk = os.pread(fd, 1 << 20, buf_off + len(buf))
+            if chunk:
+                buf += chunk
+                lines = buf.split(b"\n")
+                buf = lines.pop()
+                pos = buf_off
+                for raw in lines:
+                    line_off = pos
+                    pos += len(raw) + 1
+                    emit(grouper.feed(raw.decode("utf-8", "replace"), line_off, self.clock()), pos)
+                buf_off = pos
+                if len(buf) > AUDIT_LINE_MAX:
+                    log_err(f"audit: dropping over-long line at offset {buf_off}")
+                    buf_off += len(buf)
+                    buf = b""
+                continue
+            emit(grouper.expire(self.clock()), buf_off)
+            if rotated:
+                emit(grouper.flush(), buf_off + len(buf))
+                return
+            try:
+                st = os.stat(self.path)
+            except FileNotFoundError:
+                time.sleep(self.poll)
+                continue
+            if st.st_ino != inode or st.st_size < buf_off + len(buf):
+                # Rotated (or truncated): drain what is left, then finish it.
+                if os.fstat(fd).st_size > buf_off + len(buf):
+                    continue
+                if buf:
+                    emit(grouper.feed(buf.decode("utf-8", "replace"), buf_off, self.clock()),
+                         buf_off + len(buf))
+                    buf_off += len(buf)
+                    buf = b""
+                emit(grouper.flush(), buf_off)
+                return
+            time.sleep(self.poll)
+
+
+# --- transcripts -------------------------------------------------------------
+
+class TranscriptSource(Source):
+    """Polls transcript files every TRANSCRIPT_POLL seconds.  They are
+    agent-controlled, so: no symlink following, regular files owned by the
+    agent only, 1 MiB line cap, complete lines only, and shrink or inode
+    change is reported as transcript-rewritten.  Records are claims.
+    Cursor: {path: [inode, offset]}."""
+
+    name = "transcript"
+
+    def __init__(self, state, roots, agent_uid, boot_id, poll=TRANSCRIPT_POLL):
+        super().__init__(state)
+        self.cursor = dict(self.cursor or {})
+        self.roots = roots
+        self.agent_uid = agent_uid
+        self.boot_id = boot_id
+        self.poll = poll
+        self.files = {p: {"inode": v[0], "offset": v[1], "skip": None}
+                      for p, v in self.cursor.items()}
+        self.extra = set(self.cursor)
+        self.extra_lock = threading.Lock()
+        self.warned = set()
+
+    def add_paths(self, paths):
+        with self.extra_lock:
+            for p in paths:
+                if os.path.isabs(p):
+                    self.extra.add(os.path.normpath(p))
+
+    def apply_commit(self, cursor):
+        path, inode, offset = cursor
+        self.cursor[path] = [inode, offset]
+
+    def committed(self):
+        return self.cursor
+
+    def candidates(self):
+        found = set()
+        for root in self.roots:
+            for dirpath, _dirs, names in os.walk(root, followlinks=False):
+                for name in names:
+                    if name.endswith(".jsonl"):
+                        found.add(os.path.join(dirpath, name))
+        with self.extra_lock:
+            found |= self.extra
+        return sorted(found)
+
+    def run(self):
+        while True:
+            self.poll_once()
+            time.sleep(self.poll)
+
+    def poll_once(self):
+        for path in self.candidates():
+            try:
+                self.read_file(path)
+            except OSError as e:
+                self._warn(path, f"transcript: {path}: {e}")
+
+    def _warn(self, path, msg):
+        if (path, msg) not in self.warned:
+            self.warned.add((path, msg))
+            log_err(msg)
+
+    def read_file(self, path):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except FileNotFoundError:
+            self.files.pop(path, None)
+            with self.extra_lock:
+                self.extra.discard(path)
+            return
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                self._warn(path, f"transcript: skipping symlink {path}")
+                return
+            raise
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                self._warn(path, f"transcript: skipping non-regular file {path}")
+                return
+            if st.st_uid != self.agent_uid:
+                self._warn(path, f"transcript: skipping {path}: owner uid {st.st_uid}")
+                return
+            ent = self.files.get(path)
+            if ent and (ent["inode"] != st.st_ino or st.st_size < ent["offset"]):
+                info = {"path": path, "old_inode": ent["inode"], "new_inode": st.st_ino,
+                        "old_offset": ent["offset"], "new_size": st.st_size}
+                self.put(envelope("meta", f"{path}:{st.st_ino}:rewritten:{ent['inode']}:{ent['offset']}",
+                                  "transcript-rewritten", now_iso(), info, self.boot_id),
+                         (path, st.st_ino, 0))
+                ent = None
+            if ent is None:
+                ent = self.files[path] = {"inode": st.st_ino, "offset": 0, "skip": None}
+            self._read_lines(fd, path, ent, st.st_size)
+        finally:
+            os.close(fd)
+
+    def _read_lines(self, fd, path, ent, size):
+        budget = TRANSCRIPT_READ_BUDGET
+        while ent["offset"] < size and budget > 0:
+            chunk = os.pread(fd, TRANSCRIPT_LINE_MAX + 1, ent["offset"])
+            if not chunk:
+                return
+            budget -= len(chunk)
+            nl = chunk.find(b"\n")
+            skip = ent["skip"]
+            if nl < 0:
+                if skip:
+                    skip["hash"].update(chunk)
+                    skip["length"] += len(chunk)
+                    ent["offset"] += len(chunk)
+                elif len(chunk) > TRANSCRIPT_LINE_MAX:
+                    # Over-long line: hash it through to its newline, ship a stub.
+                    ent["skip"] = {"start": ent["offset"], "hash": hashlib.sha256(chunk),
+                                   "length": len(chunk)}
+                    ent["offset"] += len(chunk)
+                else:
+                    return                    # incomplete line: wait for more
+                continue
+            line = chunk[:nl]
+            if skip:
+                skip["hash"].update(line)
+                skip["length"] += len(line)
+                start = skip["start"]
+                ent["skip"] = None
+                ent["offset"] += nl + 1
+                data = {"path": path, "claim": True, "oversize": True,
+                        "length": skip["length"], "sha256": skip["hash"].hexdigest()}
+                rec = envelope("transcript", f"{path}:{ent['inode']}:{start}",
+                               "transcript-oversize", now_iso(), data, self.boot_id)
+            elif nl > TRANSCRIPT_LINE_MAX:
+                start = ent["offset"]
+                ent["offset"] += nl + 1
+                data = {"path": path, "claim": True, "oversize": True, "length": nl,
+                        "sha256": hashlib.sha256(line).hexdigest()}
+                rec = envelope("transcript", f"{path}:{ent['inode']}:{start}",
+                               "transcript-oversize", now_iso(), data, self.boot_id)
+            else:
+                start = ent["offset"]
+                ent["offset"] += nl + 1
+                rec = self._line_record(path, ent["inode"], start, line)
+            self.put(rec, (path, ent["inode"], ent["offset"]))
+
+    def _line_record(self, path, inode, offset, line):
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            obj = None
+        data = {"path": path, "claim": True}
+        if isinstance(obj, dict):
+            data["line"] = obj
+            ts = as_str(obj.get("timestamp")) or now_iso()
+            fields = {"session_id": as_str(obj.get("sessionId")),
+                      "agent_id": as_str(obj.get("agentId"))}
+        else:
+            data["raw"] = line.decode("utf-8", "replace")
+            ts, fields = now_iso(), {}
+        return envelope("transcript", f"{path}:{inode}:{offset}", "transcript", ts, data,
+                        self.boot_id, **fields)
+
+
+# -----------------------------------------------------------------
+# Sender
+# -----------------------------------------------------------------
+
+def connect_unix(path):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(path)
+    except OSError:
+        s.close()
+        raise
+    return s
+
+
+def connect_vsock(cid, port, source_ports=VSOCK_SOURCE_PORTS):
+    """Connect from a random source port in source_ports.  Binding a vsock
+    port below 1024 needs CAP_NET_BIND_SERVICE, which is how agent-logd
+    knows the sender is privileged inside its VM (docs/design/background.md,
+    "vsock")."""
+    s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    try:
+        ports = list(range(source_ports[0], source_ports[1] + 1))
+        random.shuffle(ports)
+        for p in ports:
+            try:
+                s.bind((socket.VMADDR_CID_ANY, p))
+                break
+            except OSError as e:
+                if e.errno != errno.EADDRINUSE:
+                    raise
+        else:
+            raise OSError(errno.EADDRINUSE, "no free vsock source port")
+        s.connect((cid, port))
+    except OSError:
+        s.close()
+        raise
+    return s
+
+
+class ProtocolError(Exception):
+    pass
+
+
+def read_reply(sock, timeout=ACK_TIMEOUT):
+    sock.settimeout(timeout)
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = sock.recv(1024)
+        if not chunk:
+            raise ProtocolError("connection closed before ack")
+        buf += chunk
+        if len(buf) > 4096:
+            raise ProtocolError("over-long reply")
+    return json.loads(buf)
+
+
+class Sender:
+    """Takes records round-robin from every source, sends them as an NDJSON
+    batch ending with {"batch": n}, waits for {"ack": n}, then persists the
+    cursors.  Retries the same batch with exponential backoff."""
+
+    def __init__(self, sources, state, connect, ack_timeout=ACK_TIMEOUT, max_backoff=60.0):
+        self.sources = sources
+        self.state = state
+        self.connect = connect
+        self.ack_timeout = ack_timeout
+        self.max_backoff = max_backoff
+        self.sock = None
+        self.n = 0
+
+    def start(self):
+        threading.Thread(target=self.run, name="sender", daemon=True).start()
+
+    def collect(self, wait=1.0):
+        batch, size = [], 0
+        deadline = time.monotonic() + wait
+        while True:
+            progress = False
+            for src in self.sources:
+                if len(batch) >= BATCH_MAX_RECORDS or size >= BATCH_MAX_BYTES:
+                    return batch
+                try:
+                    rec, cursor = src.queue.get_nowait()
+                except queue.Empty:
+                    continue
+                line = encode_json(rec) + b"\n"
+                batch.append((src, line, cursor))
+                size += len(line)
+                progress = True
+            if batch and not progress:
+                return batch
+            if not batch:
+                if time.monotonic() >= deadline:
+                    return batch
+                time.sleep(0.05)
+
+    def send_batch(self, batch):
+        self.n += 1
+        payload = b"".join(line for _, line, _ in batch) + encode_json({"batch": self.n}) + b"\n"
+        if self.sock is None:
+            self.sock = self.connect()
+        self.sock.settimeout(self.ack_timeout)
+        self.sock.sendall(payload)
+        reply = read_reply(self.sock, self.ack_timeout)
+        if reply != {"ack": self.n}:
+            raise ProtocolError(f"unexpected reply {reply!r}")
+
+    def commit(self, batch):
+        touched = []
+        for src, _, cursor in batch:
+            if cursor is not None:
+                src.apply_commit(cursor)
+            if src not in touched:
+                touched.append(src)
+        cursors = self.state.get("cursors", {}) or {}
+        for src in touched:
+            cursors[src.name] = src.committed()
+        self.state.update(cursors=cursors)
+        for src in touched:
+            src.after_commit()
+
+    def run(self):
+        while True:
+            batch = self.collect()
+            if not batch:
+                continue
+            delay = 1.0
+            while True:
+                try:
+                    self.send_batch(batch)
+                    break
+                except (OSError, ProtocolError, ValueError) as e:
+                    log_err(f"sender: delivery failed ({e}); retrying in {delay:.0f}s")
+                    if self.sock is not None:
+                        self.sock.close()
+                        self.sock = None
+                    time.sleep(delay)
+                    delay = min(delay * 2, self.max_backoff)
+            self.commit(batch)
+
+
+# -----------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------
+
+def parse_ports(text):
+    lo, _, hi = text.partition("-")
+    return int(lo), int(hi or lo)
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(description="Hook collector and log shipper.")
+    p.add_argument("--mode", required=True, choices=["host", "vm", "local"],
+                   help="host: ship to the local agent-logd unix socket; vm: ship over vsock; "
+                        "local: phase 1, collector and spool only")
+    p.add_argument("--hook-socket", default=HOOK_SOCKET)
+    p.add_argument("--runtime-dir", default=RUNTIME_DIR,
+                   help="where the audit-degraded flag file lives")
+    p.add_argument("--state-dir", default=STATE_DIR)
+    p.add_argument("--spool-cap", type=int, default=SPOOL_CAP, help="bytes")
+    p.add_argument("--segment-size", type=int, default=SEGMENT_SIZE, help="bytes")
+    p.add_argument("--logd-unix", default=LOGD_UNIX)
+    p.add_argument("--logd-cid", type=int, default=LOGD_CID)
+    p.add_argument("--logd-port", type=int, default=LOGD_PORT)
+    p.add_argument("--vsock-source-ports", type=parse_ports, default=VSOCK_SOURCE_PORTS,
+                   metavar="LO-HI", help="test only: source port range (default 600-1023)")
+    p.add_argument("--envs-conf", default=ENVS_CONF)
+    p.add_argument("--audit-log", default=AUDIT_LOG, help="'' disables the audit source")
+    p.add_argument("--auditd-conf", default=AUDITD_CONF)
+    p.add_argument("--audit-check-interval", type=float, default=60.0)
+    p.add_argument("--journalctl", default="journalctl", help="'' disables the journal source")
+    p.add_argument("--agent-user", default="agent")
+    p.add_argument("--transcripts-dir", action="append",
+                   help="default: ~AGENT_USER/.claude/projects (repeatable)")
+    p.add_argument("--egress-user", default="agent-egress")
+    p.add_argument("--logd-user", default="agent-logd")
+    p.add_argument("--proc-root", default="/proc", help="test only")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    boot_id = read_boot_id(args.proc_root)
+    os.makedirs(args.state_dir, mode=0o700, exist_ok=True)
+    os.makedirs(args.runtime_dir, mode=0o755, exist_ok=True)
+    state = State(os.path.join(args.state_dir, "state.json"))
+    spool = Spool(os.path.join(args.state_dir, "spool"), state, args.segment_size,
+                  args.spool_cap, local=args.mode == "local")
+
+    transcripts = None
+    if args.mode != "local":
+        try:
+            agent = pwd.getpwnam(args.agent_user)
+            agent_uid, agent_home = agent.pw_uid, agent.pw_dir
+        except KeyError:
+            log_err(f"user {args.agent_user!r} not found; transcript source disabled")
+            agent_uid, agent_home = None, None
+        if agent_uid is not None:
+            roots = args.transcripts_dir or [os.path.join(agent_home, ".claude", "projects")]
+            transcripts = TranscriptSource(state, roots, agent_uid, boot_id)
+
+    collector = Collector(args.hook_socket, spool, boot_id, args.proc_root,
+                          on_paths=transcripts.add_paths if transcripts else None)
+    health = AuditHealth(args.auditd_conf, os.path.dirname(args.audit_log or AUDIT_LOG),
+                         os.path.join(args.runtime_dir, "audit-degraded"),
+                         collector.emit_meta, args.audit_check_interval)
+
+    collector.start()
+    health.check_once()
+    threading.Thread(target=health.run, name="audit-health", daemon=True).start()
+
+    if args.mode != "local":
+        sources = [HookSpoolSource(state, spool, collector.wakeup)]
+        if args.journalctl:
+            sources.append(JournalSource(state, args.journalctl, uid_of(args.egress_user),
+                                         uid_of(args.logd_user), args.envs_conf))
+        if args.audit_log:
+            sources.append(AuditSource(state, args.audit_log, boot_id, read_btime(args.proc_root)))
+        if transcripts:
+            sources.append(transcripts)
+        if args.mode == "host":
+            connect = lambda: connect_unix(args.logd_unix)  # noqa: E731
+        else:
+            connect = lambda: connect_vsock(args.logd_cid, args.logd_port,  # noqa: E731
+                                            args.vsock_source_ports)
+        for src in sources:
+            src.start()
+        Sender(sources, state, connect).start()
+        log(f"shipping ({args.mode}) sources: {', '.join(s.name for s in sources)}")
+    else:
+        log("local-only mode: hook records stay in the spool")
+
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    stop.wait()
+    log("stopping")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

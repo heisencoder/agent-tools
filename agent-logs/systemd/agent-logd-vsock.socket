@@ -1,0 +1,14 @@
+# VM shippers connect here over vsock (host CID 2, port 700).  Held by
+# systemd so nothing else can take the port while agent-logd restarts.
+# Needs the vhost_vsock module (present when libvirt runs vsock VMs).
+
+[Unit]
+Description=agent-logd vsock ingest socket
+
+[Socket]
+ListenStream=vsock::700
+FileDescriptorName=vsock
+Service=agent-logd.service
+
+[Install]
+WantedBy=sockets.target

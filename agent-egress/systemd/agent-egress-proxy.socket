@@ -1,0 +1,20 @@
+# agent-egress-proxy.socket — Listening sockets for the agent egress proxy.
+#
+# systemd holds these ports from boot, so no agent process can bind 3128 while
+# the proxy restarts.  FreeBind lets the VM-side listener exist before
+# virbr-agent (192.168.123.1) is up.  The proxy tells the two listeners apart
+# by address: loopback serves the host, the other serves VMs (envs.conf).
+
+[Unit]
+Description=Agent egress proxy listening sockets
+Documentation=https://github.com/heisencoder/agent-tools/tree/main/agent-egress
+
+[Socket]
+ListenStream=127.0.0.1:3128
+ListenStream=192.168.123.1:3128
+FreeBind=yes
+NoDelay=yes
+Backlog=256
+
+[Install]
+WantedBy=sockets.target

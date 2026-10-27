@@ -1,0 +1,38 @@
+# agent-audit kernel audit rules (docs/design/implementation.md,
+# "Kernel audit rules").
+#
+# Template: agent-audit/install.sh substitutes @AGENT_UID@ with the numeric
+# UID of the agent user and installs the result as
+# /etc/audit/rules.d/50-agent.rules, then runs `augenrules --load`.
+# A -w line whose parent directory does not exist on the target (e.g. the
+# libvirt directory inside a VM) is installed commented out, because the
+# kernel rejects such a watch and auditctl would stop loading the rest.
+#
+# Kernel queue size: a burst of executions waits for space instead of
+# dropping records.
+-b 8192
+# Every program execution by the agent user
+-a always,exit -F arch=b64 -S execve,execveat -F uid=@AGENT_UID@ -k agent-exec
+-a always,exit -F arch=b32 -S execve,execveat -F uid=@AGENT_UID@ -k agent-exec
+# Unusual socket families: AF_PACKET (17), AF_VSOCK (40)
+-a always,exit -F arch=b64 -S socket -F a0=17 -F uid=@AGENT_UID@ -k agent-socket
+-a always,exit -F arch=b64 -S socket -F a0=40 -F uid=@AGENT_UID@ -k agent-socket
+-a always,exit -F arch=b32 -S socket -F a0=17 -F uid=@AGENT_UID@ -k agent-socket
+-a always,exit -F arch=b32 -S socket -F a0=40 -F uid=@AGENT_UID@ -k agent-socket
+# Secret reads (who read them is in the record; claude reading its own credentials is expected)
+-w @AGENT_HOME@/.claude/.credentials.json -p r -k agent-secret-read
+-w @AGENT_HOME@/.ssh -p r -k agent-secret-read
+# Writes to policy, binaries, and config (by anyone)
+-w /etc/claude-code/ -p wa -k agent-policy
+-w /opt/claude-code/ -p wa -k agent-policy
+-w /usr/local/bin/claude -p wa -k agent-policy
+-w /usr/local/lib/agent-audit/ -p wa -k agent-policy
+-w /usr/local/lib/agent-logs/ -p wa -k agent-policy
+-w /usr/local/sbin/agent-run -p wa -k agent-policy
+-w /etc/agent-tools/ -p wa -k agent-policy
+-w /etc/sysctl.d/ -p wa -k agent-policy
+-w /etc/pam.d/agent-run -p wa -k agent-policy
+-w /etc/agent-egress/ -p wa -k agent-policy
+-w /etc/audit/ -p wa -k agent-policy
+-w /etc/systemd/system/ -p wa -k agent-policy
+-w /etc/libvirt/qemu/networks/ -p wa -k agent-policy

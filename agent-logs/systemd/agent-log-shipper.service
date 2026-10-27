@@ -1,0 +1,42 @@
+# agent-log-shipper: hook collector + log shipper (every agent environment).
+# See docs/design/implementation.md, "Hook collector" and "Log shipper".
+#
+# The mode (host, vm, or local) and the agent account come from
+# /etc/agent-tools/agent-log-shipper.env,
+# written by agent-logs/install-env.sh.
+
+[Unit]
+Description=Agent hook collector and log shipper
+After=systemd-journald.service auditd.service
+Before=multi-user.target
+
+[Service]
+Type=simple
+Environment=SHIPPER_MODE=local AGENT_USER=agent
+EnvironmentFile=-/etc/agent-tools/agent-log-shipper.env
+ExecStart=/usr/local/lib/agent-logs/agent-log-shipper --mode ${SHIPPER_MODE} --agent-user ${AGENT_USER}
+Restart=always
+RestartSec=2
+
+User=root
+# Reading other users' /proc entries, reading transcripts in the mode-0770
+# agent's home directory, and binding a privileged vsock source port.
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_NET_BIND_SERVICE
+RestrictAddressFamilies=AF_UNIX AF_VSOCK
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+# Must NOT set ProtectProc= or PrivateUsers=: either hides the agent's
+# processes from the collector.
+RuntimeDirectory=agent-log-shipper
+RuntimeDirectoryMode=0755
+# Keep /run/agent-log-shipper (hook.sock, audit-degraded) across restarts.
+RuntimeDirectoryPreserve=yes
+StateDirectory=agent-log-shipper
+StateDirectoryMode=0700
+UMask=0077
+LogRateLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

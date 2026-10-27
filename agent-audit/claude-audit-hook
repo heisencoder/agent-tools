@@ -1,0 +1,298 @@
+#!/usr/bin/python3 -I
+# claude-audit-hook — Claude Code hook command: hand one event to the
+# root-owned hook collector and wait for it to confirm durable storage.
+#
+# Installed as /usr/local/lib/agent-audit/claude-audit-hook (root, 0755) and
+# referenced from /etc/claude-code/managed-settings.d/50-agent-audit.json for
+# every audited hook event.  See docs/design/implementation.md, "Hook protocol".
+#
+# Protocol (the contract with agent-logs/agent-log-shipper):
+#   1. Read the event JSON from stdin (at most 64 MiB).
+#   2. Truncate every string, at any depth, to 16 KiB of UTF-8.  Each
+#      truncation is recorded as audit.truncated[<json-pointer>] =
+#      {"length": <original UTF-8 bytes>, "sha256": <hex of original>}.
+#      If the framed record is still over 1 MiB, tool_input and
+#      tool_response are replaced by {"sha256", "length"} stubs.
+#   3. Connect to the collector's Unix stream socket and send one frame:
+#      a 4-byte big-endian length, then the UTF-8 JSON record.
+#   4. Wait for the 2-byte reply "ok".  Exit 0 on "ok"; anything else, EOF,
+#      or a timeout writes one line to stderr and exits 1.
+#
+# It never exits 2 and never writes to stdout: Claude Code reads stdout as
+# control JSON and exit 2 as a "blocking error" fed back to the model.  So
+# this hook can block an unloggable tool call (via "onFailure": "block" on
+# PreToolUse) but cannot otherwise steer the agent.
+#
+# Usage (Claude Code runs it; the event arrives on stdin):
+#   claude-audit-hook [--socket PATH]
+#
+# --socket exists only for tests.  The managed settings never pass it, and
+# the path is deliberately NOT read from the environment, which the agent's
+# own settings can influence.
+#
+# Standard library only; Python >= 3.12.  The -I flag on the shebang ignores
+# PYTHON* environment variables and the user site directory, so the agent
+# cannot inject code into this process through them.
+
+import hashlib
+import json
+import os
+import socket
+import struct
+import sys
+import time
+from datetime import datetime, timezone
+
+DEFAULT_SOCKET = "/run/agent-log-shipper/hook.sock"
+MAX_STDIN = 64 * 1024 * 1024    # largest event we accept on stdin
+MAX_STRING = 16 * 1024          # per-string cap, in UTF-8 bytes
+MAX_FRAME = 1024 * 1024         # cap on header + body, so either reading of
+                                # "max frame 1 MiB" by the collector holds
+TIMEOUT = 5.0                   # whole exchange with the collector, seconds
+
+# Top-level fields replaced by stubs when the record is still too large,
+# in this order (implementation.md, "Hook protocol").
+STUB_FIELDS = ("tool_input", "tool_response")
+
+
+class HookError(Exception):
+    """A failure reported as one line on stderr and exit status 1."""
+
+
+# -----------------------------------------------------------------
+# Truncation
+# -----------------------------------------------------------------
+
+def utf8(s):
+    # "surrogatepass" so that lone surrogates (legal in JSON "\ud800"
+    # escapes, illegal in UTF-8) still hash and measure deterministically.
+    return s.encode("utf-8", "surrogatepass")
+
+
+def digest(data):
+    return {"length": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def pointer(parent, token):
+    """Extend a JSON pointer (RFC 6901) with one reference token."""
+    token = str(token).replace("~", "~0").replace("/", "~1")
+    return parent + "/" + token
+
+
+def cut(s):
+    """Return the first MAX_STRING UTF-8 bytes of s, without splitting a
+    character, plus the digest of the original."""
+    raw = utf8(s)
+    head = raw[:MAX_STRING].decode("utf-8", "ignore")
+    return head, digest(raw)
+
+
+def truncate(value, path, truncated):
+    """Return a copy of value with every long string cut to MAX_STRING
+    bytes; record each cut in `truncated` keyed by its JSON pointer.
+
+    Dict keys are strings too.  A long key is cut and suffixed with "#" and
+    16 hex digits of its hash, so two long keys with the same prefix cannot
+    collide; its entry is recorded at the key's (new) pointer with
+    "key": true.
+    """
+    if isinstance(value, str):
+        if len(value) * 4 <= MAX_STRING or len(utf8(value)) <= MAX_STRING:
+            return value
+        head, info = cut(value)
+        truncated[path] = info
+        return head
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if len(utf8(key)) > MAX_STRING:
+                head, info = cut(key)
+                key = head + "#" + info["sha256"][:16]
+                truncated[pointer(path, key)] = dict(info, key=True)
+            out[key] = truncate(item, pointer(path, key), truncated)
+        return out
+    if isinstance(value, list):
+        return [truncate(item, pointer(path, i), truncated)
+                for i, item in enumerate(value)]
+    return value  # numbers, booleans, null
+
+
+# -----------------------------------------------------------------
+# Record building and framing
+# -----------------------------------------------------------------
+
+def now_rfc3339():
+    ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    return ts.replace("+00:00", "Z")
+
+
+def encode(obj):
+    """Serialize to UTF-8 JSON.  Lone surrogates cannot be UTF-8 encoded, so
+    such records fall back to ASCII-only JSON (\\u escapes), which is still
+    valid UTF-8."""
+    try:
+        return json.dumps(obj, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(obj, ensure_ascii=True,
+                          separators=(",", ":")).encode("ascii")
+
+
+def build_record(event, hook_ts=None):
+    """Return the framed bytes (header + body) for one parsed event."""
+    if not isinstance(event, dict):
+        raise HookError("event is not a JSON object")
+    truncated = {}
+    record = truncate(event, "", truncated)
+
+    def assemble():
+        audit = {"hook_ts": hook_ts or now_rfc3339()}
+        if truncated:
+            audit = {"truncated": truncated, **audit}
+        # Claude Code never sends a top-level "audit" key; if one ever
+        # appears it is replaced, so the collector can trust this one.
+        record["audit"] = audit
+        return encode(record)
+
+    body = assemble()
+    if 4 + len(body) > MAX_FRAME:
+        # Still too large (very many fields, or many truncated strings):
+        # stub tool_input and tool_response (both, as the contract says).
+        for key in STUB_FIELDS:
+            if key in event:
+                stub(record, truncated, event, key)
+        body = assemble()
+        # Last resort, not expected from Claude Code's own events: stub
+        # any other large top-level field, largest first, until it fits.
+        others = sorted((k for k in event
+                         if k not in STUB_FIELDS and k != "audit"),
+                        key=lambda k: len(encode(record[k])), reverse=True)
+        for key in others:
+            if 4 + len(body) <= MAX_FRAME:
+                break
+            stub(record, truncated, event, key)
+            body = assemble()
+        if 4 + len(body) > MAX_FRAME:
+            raise HookError("record exceeds 1 MiB even after stubbing")
+    return struct.pack(">I", len(body)) + body
+
+
+def stub(record, truncated, event, key):
+    """Replace record[key] by {"sha256", "length"} of the ORIGINAL value's
+    compact JSON serialization, and record that under audit.truncated."""
+    path = pointer("", key)
+    info = digest(encode(event[key]))
+    record[key] = dict(info)
+    # Entries for strings inside the stubbed value no longer describe
+    # anything in the record; drop them (they also take space).
+    for p in [p for p in truncated if p.startswith(path + "/")]:
+        del truncated[p]
+    truncated[path] = info
+
+
+# -----------------------------------------------------------------
+# Collector exchange
+# -----------------------------------------------------------------
+
+def send(frame, socket_path):
+    """Send one frame and require the reply b"ok" within TIMEOUT seconds
+    for the whole exchange."""
+    deadline = time.monotonic() + TIMEOUT
+
+    def remaining():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise HookError("timed out waiting for collector")
+        return left
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(remaining())
+            sock.connect(socket_path)
+            view = memoryview(frame)
+            while view:
+                sock.settimeout(remaining())
+                n = sock.send(view)
+                view = view[n:]
+            reply = b""
+            while len(reply) < 2:
+                sock.settimeout(remaining())
+                chunk = sock.recv(2 - len(reply))
+                if not chunk:
+                    break
+                reply += chunk
+    except (TimeoutError, socket.timeout):
+        raise HookError("timed out waiting for collector") from None
+    except OSError as e:
+        raise HookError(f"cannot reach collector at {socket_path}: "
+                        f"{e.strerror or e}") from None
+    if reply != b"ok":
+        raise HookError(f"collector did not acknowledge (reply {reply!r})")
+
+
+# -----------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------
+
+def parse_args(argv):
+    # Hand-rolled on purpose: argparse exits with status 2 on bad usage,
+    # and this program must never exit 2.
+    socket_path = DEFAULT_SOCKET
+    args = list(argv)
+    while args:
+        arg = args.pop(0)
+        if arg == "--socket" and args:
+            socket_path = args.pop(0)
+        elif arg.startswith("--socket="):
+            socket_path = arg.split("=", 1)[1]
+        else:
+            raise HookError(f"unknown argument {arg!r}")
+    return socket_path
+
+
+def read_stdin():
+    data = sys.stdin.buffer.read(MAX_STDIN + 1)
+    if len(data) > MAX_STDIN:
+        raise HookError("event on stdin exceeds 64 MiB")
+    return data
+
+
+def main(argv):
+    socket_path = parse_args(argv)
+    try:
+        event = json.loads(read_stdin())
+    except (ValueError, RecursionError) as e:
+        raise HookError(f"cannot parse event JSON: {e}") from None
+    frame = build_record(event)
+    send(frame, socket_path)
+
+
+def run():
+    # Point fd 1 at /dev/null so nothing, not even an interpreter warning,
+    # can reach Claude Code's control channel.
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)
+        os.close(devnull)
+    except OSError:
+        pass
+    status = 1
+    try:
+        main(sys.argv[1:])
+        status = 0
+    except HookError as e:
+        msg = str(e)
+    except BaseException as e:  # noqa: BLE001 — never exit 2, never trace
+        msg = f"internal error: {type(e).__name__}: {e}"
+    if status:
+        try:
+            sys.stderr.write("claude-audit-hook: " + msg.replace("\n", " ")
+                             + "\n")
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001
+            pass
+    os._exit(status)
+
+
+if __name__ == "__main__":
+    run()

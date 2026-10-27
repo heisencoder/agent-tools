@@ -1,0 +1,16 @@
+# Optional OTLP/HTTP receiver (docs/design/implementation.md,
+# "OpenTelemetry"): Claude Code on the host and in VMs exports telemetry here.  Unauthenticated; records are supplementary claims.
+# FreeBind lets the 192.168.123.1 listener exist before virbr-agent is up.
+
+[Unit]
+Description=agent-logd OTLP/HTTP socket
+
+[Socket]
+ListenStream=127.0.0.1:4318
+ListenStream=192.168.123.1:4318
+FreeBind=yes
+FileDescriptorName=otlp
+Service=agent-logd.service
+
+[Install]
+WantedBy=sockets.target

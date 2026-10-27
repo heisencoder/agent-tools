@@ -1,0 +1,43 @@
+# agent-egress-proxy.service — Allowlisting HTTP proxy for coding agents.
+#
+# Started by agent-egress-proxy.socket.  Decisions are logged as one JSON line
+# per connection on stdout, i.e. to the journal under this unit.
+#   Reload allowlist and envs.conf:  systemctl reload agent-egress-proxy
+#   Watch decisions:                 journalctl -u agent-egress-proxy -f
+
+[Unit]
+Description=Agent egress proxy
+Documentation=https://github.com/heisencoder/agent-tools/tree/main/agent-egress
+Requires=agent-egress-proxy.socket agent-egress-nft.service
+After=agent-egress-proxy.socket agent-egress-nft.service
+
+[Service]
+Type=exec
+User=agent-egress
+Group=agent-egress
+ExecStart=/usr/bin/python3 -I /usr/local/lib/agent-egress/agent-egress-proxy
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+
+# Hardening (docs/design/implementation.md, "Egress proxy").
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+# AF_NETLINK: glibc getaddrinfo() may query interface addresses.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+MemoryMax=256M
+LimitNOFILE=4096
+LogRateLimitIntervalSec=0
