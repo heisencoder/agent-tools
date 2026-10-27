@@ -1,0 +1,146 @@
+{
+ "resourceLogs": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "claude-code"
+      }
+     },
+     {
+      "key": "service.version",
+      "value": {
+       "stringValue": "2.1.300"
+      }
+     }
+    ]
+   },
+   "scopeLogs": [
+    {
+     "scope": {
+      "name": "com.anthropic.claude_code.events",
+      "version": "2.1.300"
+     },
+     "logRecords": [
+      {
+       "timeUnixNano": "1793136000123000000",
+       "observedTimeUnixNano": "1793136000124000000",
+       "severityText": "INFO",
+       "body": {
+        "stringValue": "claude_code.api_request"
+       },
+       "attributes": [
+        {
+         "key": "event.name",
+         "value": {
+          "stringValue": "api_request"
+         }
+        },
+        {
+         "key": "session.id",
+         "value": {
+          "stringValue": "sess-1111"
+         }
+        },
+        {
+         "key": "model",
+         "value": {
+          "stringValue": "claude-opus-5-5"
+         }
+        },
+        {
+         "key": "cost_usd",
+         "value": {
+          "doubleValue": 0.0123
+         }
+        },
+        {
+         "key": "input_tokens",
+         "value": {
+          "intValue": "1200"
+         }
+        },
+        {
+         "key": "output_tokens",
+         "value": {
+          "intValue": "340"
+         }
+        },
+        {
+         "key": "duration_ms",
+         "value": {
+          "intValue": "2100"
+         }
+        }
+       ]
+      },
+      {
+       "timeUnixNano": "1793136001000000000",
+       "body": {
+        "stringValue": "claude_code.tool_result"
+       },
+       "attributes": [
+        {
+         "key": "event.name",
+         "value": {
+          "stringValue": "tool_result"
+         }
+        },
+        {
+         "key": "session.id",
+         "value": {
+          "stringValue": "sess-1111"
+         }
+        },
+        {
+         "key": "tool_name",
+         "value": {
+          "stringValue": "Bash"
+         }
+        },
+        {
+         "key": "success",
+         "value": {
+          "boolValue": true
+         }
+        },
+        {
+         "key": "tool_parameters",
+         "value": {
+          "kvlistValue": {
+           "values": [
+            {
+             "key": "command",
+             "value": {
+              "stringValue": "ls"
+             }
+            }
+           ]
+          }
+         }
+        },
+        {
+         "key": "tags",
+         "value": {
+          "arrayValue": {
+           "values": [
+            {
+             "stringValue": "a"
+            },
+            {
+             "stringValue": "b"
+            }
+           ]
+          }
+         }
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

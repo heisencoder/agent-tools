@@ -1,0 +1,22 @@
+<!--
+  vm-interface.xml - Devices to put in each agent VM's domain XML
+  (`virsh edit VM`, inside <devices>), replacing any other <interface>.
+  The VM must attach only to agent-net.
+
+  install-host.sh renders one copy per environment in envs.conf to
+  /etc/agent-egress/libvirt/<name>-interface.xml, filling in the MAC, IP,
+  and CID placeholders.  The clean-traffic filter stops the VM from spoofing its MAC or IP,
+  which is what lets the proxy trust the source address.  The vsock CID is
+  pinned for agent-logs (docs/design/implementation.md, "Log shipper").
+-->
+<interface type='network'>
+  <source network='agent-net'/>
+  <mac address='@MAC@'/>
+  <port isolated='yes'/>
+  <filterref filter='clean-traffic'>
+    <parameter name='IP' value='@IP@'/>
+  </filterref>
+</interface>
+<vsock model='virtio'>
+  <cid auto='no' address='@CID@'/>
+</vsock>

@@ -1,0 +1,35 @@
+#!/usr/sbin/nft -f
+# agent-vmnet.nft — Host-side guard for the isolated VM network (virbr-agent,
+# docs/design/implementation.md, "Isolated VM network").
+#
+# agent-net has no <forward> element, so libvirt installs no route or NAT.
+# This table keeps it that way even if something later enables forwarding,
+# and limits what VMs may reach on the host itself: DHCP plus the egress
+# proxy (3128) and OTLP receiver (4318) on 192.168.123.1.  Everything else
+# arriving from virbr-agent is logged (rate-limited) and dropped.
+#
+# Priority "filter - 1" runs these chains just before other filter chains.
+# A drop here is final; an accept still lets other tables (ufw, firewalld,
+# libvirt) apply their own rules.
+
+table inet agent_vmnet
+delete table inet agent_vmnet
+
+table inet agent_vmnet {
+	chain input {
+		type filter hook input priority filter - 1; policy accept;
+		iifname != "virbr-agent" accept
+		ct state established,related accept
+		udp dport 67 accept
+		ip daddr 192.168.123.1 tcp dport { 3128, 4318 } accept
+		limit rate 10/second log prefix "agent-vmnet-drop "
+		counter drop
+	}
+
+	chain forward {
+		type filter hook forward priority filter - 1; policy accept;
+		iifname "virbr-agent" limit rate 10/second log prefix "agent-vmnet-fwd-drop "
+		iifname "virbr-agent" counter drop
+		oifname "virbr-agent" counter drop
+	}
+}

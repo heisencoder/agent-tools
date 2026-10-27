@@ -1,0 +1,4 @@
+# PyPI.  files.pythonhosted.org is Fastly-fronted; see the CDN caveat in
+# npm.list.  A local mirror (e.g. devpi) is the stronger option.
+pypi.org
+files.pythonhosted.org

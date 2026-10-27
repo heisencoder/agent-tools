@@ -1,0 +1,5 @@
+# Ubuntu archive for apt inside VMs (apt uses plain HTTP on port 80).
+# Enable before running apt in a VM; disable afterwards if desired.
+archive.ubuntu.com
+security.ubuntu.com
+.archive.ubuntu.com

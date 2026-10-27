@@ -1,0 +1,7 @@
+# GitHub over HTTPS: git clone/fetch/push, the gh CLI, release and raw
+# downloads.  SSH remotes are rewritten to HTTPS (see README).
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com

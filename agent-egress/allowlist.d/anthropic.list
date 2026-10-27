@@ -1,0 +1,14 @@
+# Claude Code: hosts from the "Network access requirements" table in Claude
+# Code's network-configuration docs.  Nonessential telemetry hosts are omitted
+# because 40-agent-egress.json sets CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1.
+#
+# Syntax (all *.list files): one pattern per line, '#' starts a comment.
+#   example.com     matches exactly example.com
+#   .example.com    matches example.com and every subdomain
+api.anthropic.com
+claude.ai
+claude.com
+platform.claude.com
+sso.claude.com
+downloads.claude.ai
+code.claude.com

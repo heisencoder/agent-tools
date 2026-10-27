@@ -1,0 +1,22 @@
+<!--
+  agent-net.xml - Isolated libvirt network for agent VMs
+  (docs/design/implementation.md, "Isolated VM network").
+
+  No <forward> element: no route or NAT to the outside.  DNS is disabled, so
+  VMs have no DNS channel at all.  DHCP hands out only the static leases
+  install-host.sh generates from /etc/agent-tools/envs.conf (it replaces the
+  DHCP_HOSTS placeholder line); unknown MACs get no address.  Every port is isolated, so
+  VMs cannot talk to each other.  VMs reach only 192.168.123.1:3128 (proxy)
+  and :4318 (OTLP), enforced on the host by agent-vmnet.nft.
+-->
+<network>
+  <name>agent-net</name>
+  <bridge name='virbr-agent' stp='on' delay='0'/>
+  <port isolated='yes'/>
+  <dns enable='no'/>
+  <ip address='192.168.123.1' netmask='255.255.255.0'>
+    <dhcp>
+      @DHCP_HOSTS@
+    </dhcp>
+  </ip>
+</network>

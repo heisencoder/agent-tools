@@ -1,0 +1,713 @@
+#!/usr/bin/python3 -I
+# agent-logd — central receiver and store for agent audit records (host).
+#
+# Runs as system user agent-logd (agent-logd.service) and takes its listening
+# sockets from systemd socket units (docs/design/implementation.md, "agent-logd"):
+#
+#   agent-logd-vsock.socket  vsock::700               FileDescriptorName=vsock
+#   agent-logd-unix.socket   /run/agent-logd/ingest.sock (0600 root)  =unix
+#   agent-logd-otlp.socket   127.0.0.1:4318, 192.168.123.1:4318       =otlp
+#
+# Sender authentication comes from the transport, never from the payload:
+#   vsock  peer CID must be listed in /etc/agent-tools/envs.conf and the
+#          source port must be <= 1023 (bound by root in the VM); CID 1
+#          (host loopback), CID 2 and unknown CIDs are rejected.  env = name.
+#   unix   SO_PEERCRED uid must be 0.  env = "host".
+#
+# Ingest protocol (shared with agent-log-shipper): NDJSON envelopes, each
+# batch ending with {"batch": n}; after fsync we answer {"ack": n}.
+#
+# Store: /var/log/agent-audit/<env>/<YYYY-MM-DD>.jsonl (UTC date of
+# recv_ts), directories 2750 agent-logd:agent-audit, files 0640.  Lines over
+# 2 MiB become "meta oversize" records; each environment may write 2 GiB per
+# day, after which one "quota-exceeded" record is written and the rest are
+# dropped (still acked, so a shipper never retries forever).
+#
+# Optional OTLP/HTTP JSON receiver (POST /v1/logs, /v1/metrics): records are
+# flattened to source=otel, env=host, client_env from the source address.
+# They are stored in host/otel-<DATE>.jsonl with their own quota, so a flood
+# of (unauthenticated) OTLP posts cannot use up the host's hook-record quota.
+#
+# Usage:
+#   agent-logd                          # under systemd (socket activation)
+#   agent-logd --store DIR --listen-unix PATH [--allow-any-uid]   # dev/tests
+#
+# Standard library only; Python >= 3.12.
+
+import argparse
+import gzip
+import hashlib
+import io
+import json
+import os
+import re
+import signal
+import socket
+import socketserver
+import stat
+import struct
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+STORE = "/var/log/agent-audit"
+ENVS_CONF = "/etc/agent-tools/envs.conf"
+LINE_MAX = 2 << 20               # a stored line over this becomes meta oversize
+QUOTA = 2 << 30                  # bytes per environment per day
+OTLP_BODY_MAX = 16 << 20
+IDLE_TIMEOUT = 600.0             # seconds an ingest connection may sit idle
+VSOCK_PRIVILEGED_MAX = 1023
+CID_LOOPBACK, CID_HOST = 1, 2
+
+SOURCES = frozenset({"hook", "audit", "egress", "netfilter", "transcript", "otel", "meta"})
+ENVELOPE_KEYS = ("ts", "recv_ts", "env", "client_env", "boot_id", "source", "source_id",
+                 "run_id", "session_id", "agent_id", "uid", "auid", "ses", "pid", "event", "data")
+NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
+SOURCE_RE = re.compile(rb'"source"\s*:\s*"((?:[^"\\]|\\.){0,256})"')
+SOURCE_ID_RE = re.compile(rb'"source_id"\s*:\s*"((?:[^"\\]|\\.){0,4096})"')
+
+
+def log(msg, level=6):
+    for line in str(msg).splitlines() or [""]:
+        print(f"<{level}>{line}", file=sys.stderr, flush=True)
+
+
+def log_err(msg):
+    log(msg, 3)
+
+
+def utc_iso(t):
+    ms = int(round(t * 1000))
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms // 1000)) + ".%03dZ" % (ms % 1000)
+
+
+def encode_json(obj):
+    try:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(obj, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+
+
+def parse_envs_conf(path):
+    """Parse envs.conf into [{"name", "cid", "ip", "mac"}].  A missing file
+    is an empty registry; a malformed one raises ValueError.  (Duplicated
+    from agent-log-shipper so each program stays a single file.)"""
+    envs = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return envs
+    for lineno, line in enumerate(text.splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        name, *fields = line.split()
+        if not NAME_RE.match(name) or name == "host":
+            raise ValueError(f"{path}:{lineno}: bad environment name {name!r}")
+        entry = {"name": name}
+        for field in fields:
+            key, sep, value = field.partition("=")
+            if not sep:
+                raise ValueError(f"{path}:{lineno}: expected key=value, got {field!r}")
+            entry[key] = value
+        if "cid" in entry:
+            entry["cid"] = int(entry["cid"])
+        envs.append(entry)
+    return envs
+
+
+class Registry:
+    """envs.conf, re-read whenever its mtime changes.  A malformed file
+    fails closed: no VM is recognized until it is fixed."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.mtime = None
+        self.by_cid, self.by_ip = {}, {}
+
+    def refresh(self):
+        try:
+            mtime = os.stat(self.path).st_mtime_ns
+        except FileNotFoundError:
+            mtime = None
+        with self.lock:
+            if mtime == self.mtime and self.mtime is not None:
+                return
+            self.mtime = mtime
+            try:
+                envs = parse_envs_conf(self.path)
+            except (OSError, ValueError) as e:
+                log_err(f"envs.conf: {e}; rejecting all VM peers until fixed")
+                envs = []
+            self.by_cid = {e["cid"]: e["name"] for e in envs if "cid" in e}
+            self.by_ip = {e["ip"]: e["name"] for e in envs if "ip" in e}
+
+    def cids(self):
+        self.refresh()
+        return dict(self.by_cid)
+
+    def env_for_ip(self, ip):
+        self.refresh()
+        if ip.startswith("::ffff:"):
+            ip = ip[len("::ffff:"):]
+        if ip in ("127.0.0.1", "::1"):
+            return "host"
+        return self.by_ip.get(ip)
+
+
+# -----------------------------------------------------------------
+# Peer checks (pure functions, unit-tested with injected addresses)
+# -----------------------------------------------------------------
+
+def check_vsock_peer(cid, port, cid_to_env, allow_loopback=False, allow_unprivileged=False):
+    """-> (env, None) to accept or (None, reason) to reject.  The test-only
+    flags admit CID 1 and unprivileged source ports."""
+    if cid == CID_HOST or (cid == CID_LOOPBACK and not allow_loopback):
+        return None, f"reserved CID {cid}"
+    env = cid_to_env.get(cid)
+    if env is None:
+        return None, f"unknown CID {cid}"
+    if port > VSOCK_PRIVILEGED_MAX and not allow_unprivileged:
+        return None, f"unprivileged source port {port} from CID {cid} ({env})"
+    return env, None
+
+
+def check_unix_peer(uid, allow_any_uid=False):
+    if uid == 0 or allow_any_uid:
+        return "host", None
+    return None, f"peer uid {uid} is not root"
+
+
+# -----------------------------------------------------------------
+# Store
+# -----------------------------------------------------------------
+
+class Store:
+    """Per-environment daily JSONL files with a byte quota per file."""
+
+    def __init__(self, root, quota=QUOTA, fsync=os.fsync):
+        self.root = root
+        self.quota = quota
+        self.fsync = fsync
+        self.lock = threading.Lock()
+        self.files = {}          # (env, name) -> {"fd", "size", "exceeded"}
+        self.dirty = set()
+
+    def _env_dir(self, env):
+        if not NAME_RE.match(env):
+            raise ValueError(f"bad environment name {env!r}")
+        path = os.path.join(self.root, env)
+        try:
+            os.mkdir(path, 0o2750)
+            os.chmod(path, 0o2750)       # mkdir is subject to the umask
+        except FileExistsError:
+            pass
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(f"{path} is not a directory")
+        return path
+
+    def _file(self, env, name):
+        key = (env, name)
+        f = self.files.get(key)
+        if f is None:
+            # Close this environment's files of the same kind (yesterday's).
+            def kind(n):
+                return n.startswith("otel-")
+            for k in [k for k in self.files if k[0] == env and kind(k[1]) == kind(name)]:
+                old = self.files.pop(k)["fd"]
+                if k in self.dirty:
+                    self.fsync(old)
+                    self.dirty.discard(k)
+                os.close(old)
+            directory = self._env_dir(env)
+            path = os.path.join(directory, name)
+            existed = os.path.exists(path)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o640)
+            os.fchmod(fd, 0o640)
+            if not existed:
+                dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            size = os.fstat(fd).st_size
+            # After a restart, a file already at its quota has its
+            # quota-exceeded record; do not write another.
+            f = self.files[key] = {"fd": fd, "size": size, "exceeded": size >= self.quota}
+        return key, f
+
+    def append(self, env, rec, otel=False):
+        """Append one normalized record (not yet durable).  Returns False if
+        it was dropped by the quota."""
+        date = rec["recv_ts"][:10]
+        name = f"otel-{date}.jsonl" if otel else f"{date}.jsonl"
+        line = encode_json(rec) + b"\n"
+        with self.lock:
+            key, f = self._file(env, name)
+            if f["size"] + len(line) > self.quota:
+                if not f["exceeded"]:
+                    f["exceeded"] = True
+                    note = normalize({"source": "meta", "source_id": f"quota:{name}",
+                                      "event": "quota-exceeded",
+                                      "data": {"file": name, "quota_bytes": self.quota}},
+                                     env, rec["recv_ts"])
+                    self._write(key, f, encode_json(note) + b"\n")
+                    log_err(f"{env}: quota of {self.quota} bytes reached for {name}; dropping records")
+                return False
+            self._write(key, f, line)
+            return True
+
+    def _write(self, key, f, data):
+        os.write(f["fd"], data)
+        f["size"] += len(data)
+        self.dirty.add(key)
+
+    def sync(self):
+        with self.lock:
+            for key in list(self.dirty):
+                if key in self.files:
+                    self.fsync(self.files[key]["fd"])
+            self.dirty.clear()
+
+
+def normalize(rec, env, recv_ts):
+    """Envelope in canonical key order.  env and recv_ts are always ours;
+    unknown top-level keys are dropped."""
+    out = {k: rec.get(k) for k in ENVELOPE_KEYS}
+    out["env"], out["recv_ts"] = env, recv_ts
+    if not out["ts"]:
+        out["ts"] = recv_ts
+    return out
+
+
+def meta_record(event, source_id, data, env, recv_ts):
+    return normalize({"source": "meta", "source_id": source_id, "event": event, "data": data},
+                     env, recv_ts)
+
+
+def read_bounded_line(f, limit=LINE_MAX):
+    """Read one line from a binary file object without holding more than
+    limit bytes.  Returns None at EOF, ("line", bytes) for a normal line,
+    ("oversize", length, sha256, head) for an over-long one, or
+    ("partial", bytes) for an unterminated last line."""
+    first = f.readline(limit + 1)
+    if not first:
+        return None
+    if first.endswith(b"\n"):
+        return ("line", first[:-1])
+    if len(first) <= limit:
+        return ("partial", first)
+    h, n, head = hashlib.sha256(first), len(first), first[:65536]
+    while True:
+        chunk = f.readline(1 << 20)
+        if not chunk:
+            break
+        if chunk.endswith(b"\n"):
+            h.update(chunk[:-1])
+            n += len(chunk) - 1
+            break
+        h.update(chunk)
+        n += len(chunk)
+    return ("oversize", n, h.hexdigest(), head)
+
+
+def _regex_str(regex, head):
+    m = regex.search(head)
+    if not m:
+        return None
+    try:
+        return json.loads(b'"' + m.group(1) + b'"')
+    except ValueError:
+        return None
+
+
+def process_line(item, env, recv_ts):
+    """One read_bounded_line() result -> ("batch", n) | ("record", rec)."""
+    if item[0] == "oversize":
+        _, length, digest, head = item
+        src, sid = _regex_str(SOURCE_RE, head), _regex_str(SOURCE_ID_RE, head)
+        data = {"source": src, "source_id": sid, "length": length, "sha256": digest}
+        return ("record", meta_record("oversize", f"oversize:{src}:{sid}:{digest}", data,
+                                      env, recv_ts))
+    line = item[1]
+    try:
+        obj = json.loads(line)
+    except (ValueError, RecursionError):
+        obj = None
+    if isinstance(obj, dict) and list(obj) == ["batch"] and type(obj["batch"]) is int:
+        return ("batch", obj["batch"])
+    if not isinstance(obj, dict) or obj.get("source") not in SOURCES:
+        digest = hashlib.sha256(line).hexdigest()
+        return ("record", meta_record("invalid-record", f"invalid:{digest}",
+                                      {"length": len(line), "sha256": digest}, env, recv_ts))
+    return ("record", normalize(obj, env, recv_ts))
+
+
+def handle_ingest(conn, env, store, idle_timeout=IDLE_TIMEOUT):
+    """Serve one authenticated shipper connection until it closes."""
+    conn.settimeout(idle_timeout)
+    f = conn.makefile("rb")
+    count = 0
+    try:
+        while True:
+            item = read_bounded_line(f)
+            if item is None or item[0] == "partial":
+                return count
+            kind, value = process_line(item, env, utc_iso(time.time()))
+            if kind == "batch":
+                store.sync()
+                conn.sendall(encode_json({"ack": value}) + b"\n")
+            else:
+                store.append(env, value)
+                count += 1
+    finally:
+        f.close()
+
+
+# -----------------------------------------------------------------
+# OTLP/HTTP JSON
+# -----------------------------------------------------------------
+
+def otlp_value(v):
+    """OTLP AnyValue -> plain JSON value."""
+    if not isinstance(v, dict):
+        return v
+    for key in ("stringValue", "boolValue", "doubleValue", "bytesValue"):
+        if key in v:
+            return v[key]
+    if "intValue" in v:
+        try:
+            return int(v["intValue"])
+        except (TypeError, ValueError):
+            return v["intValue"]
+    if "arrayValue" in v:
+        return [otlp_value(x) for x in (v["arrayValue"] or {}).get("values", []) or []]
+    if "kvlistValue" in v:
+        return otlp_attrs((v["kvlistValue"] or {}).get("values", []))
+    return None
+
+
+def otlp_attrs(items):
+    out = {}
+    for a in items or []:
+        if isinstance(a, dict) and isinstance(a.get("key"), str):
+            out[a["key"]] = otlp_value(a.get("value"))
+    return out
+
+
+def nanos_iso(*values):
+    for v in values:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return utc_iso(n / 1e9)
+    return None
+
+
+def otel_record(event, ts, data, client_env, recv_ts):
+    attrs = data.get("attributes") or {}
+    rec = {"ts": ts, "client_env": client_env, "source": "otel", "event": event,
+           "session_id": attrs.get("session.id") if isinstance(attrs.get("session.id"), str) else None,
+           "data": data}
+    # No natural ID: derive one from the content, so a retried export of the
+    # same record de-duplicates at query time.
+    rec["source_id"] = hashlib.sha256(encode_json([client_env, ts, data])).hexdigest()[:32]
+    return normalize(rec, "host", recv_ts)
+
+
+def _list(obj, key):
+    v = obj.get(key) if isinstance(obj, dict) else None
+    return [x for x in v if isinstance(x, dict)] if isinstance(v, list) else []
+
+
+def flatten_logs(body, client_env, recv_ts):
+    out = []
+    for rl in _list(body, "resourceLogs"):
+        resource = otlp_attrs((rl.get("resource") or {}).get("attributes"))
+        for sl in _list(rl, "scopeLogs"):
+            scope = (sl.get("scope") or {}).get("name")
+            for lr in _list(sl, "logRecords"):
+                attrs = otlp_attrs(lr.get("attributes"))
+                value = otlp_value(lr.get("body"))
+                name = attrs.get("event.name") or (value if isinstance(value, str) else None) or "log"
+                name = str(name)
+                data = {"kind": "log", "name": name, "attributes": attrs, "body": value,
+                        "severity": lr.get("severityText"), "resource": resource, "scope": scope}
+                ts = nanos_iso(lr.get("timeUnixNano"), lr.get("observedTimeUnixNano")) or recv_ts
+                out.append(otel_record(name.removeprefix("claude_code."), ts, data, client_env,
+                                       recv_ts))
+    return out
+
+
+def flatten_metrics(body, client_env, recv_ts):
+    out = []
+    for rm in _list(body, "resourceMetrics"):
+        resource = otlp_attrs((rm.get("resource") or {}).get("attributes"))
+        for sm in _list(rm, "scopeMetrics"):
+            scope = (sm.get("scope") or {}).get("name")
+            for metric in _list(sm, "metrics"):
+                name = str(metric.get("name") or "metric")
+                for mtype in ("sum", "gauge", "histogram", "exponentialHistogram", "summary"):
+                    if isinstance(metric.get(mtype), dict):
+                        break
+                else:
+                    continue
+                for dp in _list(metric[mtype], "dataPoints"):
+                    value = dp.get("asDouble", dp.get("asInt"))
+                    if isinstance(value, str):
+                        try:
+                            value = int(value)
+                        except ValueError:
+                            pass
+                    data = {"kind": "metric", "name": name, "type": mtype,
+                            "unit": metric.get("unit"), "value": value,
+                            "attributes": otlp_attrs(dp.get("attributes")),
+                            "resource": resource, "scope": scope}
+                    for extra in ("count", "sum", "min", "max"):
+                        if extra in dp:
+                            data[extra] = dp[extra]
+                    ts = nanos_iso(dp.get("timeUnixNano"), dp.get("startTimeUnixNano")) or recv_ts
+                    out.append(otel_record(name.removeprefix("claude_code."), ts, data,
+                                           client_env, recv_ts))
+    return out
+
+
+class OTLPHandler(BaseHTTPRequestHandler):
+    server_version = "agent-logd"
+    timeout = 30
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):     # quiet: errors are logged explicitly
+        pass
+
+    def reply(self, code, body=b"{}"):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.reply(405)
+
+    def do_POST(self):
+        logd = self.server.logd
+        # Consume the body first so a keep-alive connection stays in sync
+        # whatever we answer.
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self.close_connection = True
+            return self.reply(411)
+        if not 0 <= length <= OTLP_BODY_MAX:
+            self.close_connection = True
+            return self.reply(413)
+        body = self.rfile.read(length)
+        path = self.path.split("?", 1)[0]
+        flatten = {"/v1/logs": flatten_logs, "/v1/metrics": flatten_metrics}.get(path)
+        if flatten is None:
+            return self.reply(404)
+        client_env = logd.registry.env_for_ip(self.client_address[0])
+        if client_env is None:
+            log_err(f"otlp: rejecting unknown client {self.client_address[0]}")
+            return self.reply(403)
+        if "json" not in (self.headers.get("Content-Type") or ""):
+            return self.reply(415)
+        try:
+            if (self.headers.get("Content-Encoding") or "").lower() == "gzip":
+                with gzip.GzipFile(fileobj=io.BytesIO(body)) as gz:
+                    body = gz.read(OTLP_BODY_MAX + 1)
+                if len(body) > OTLP_BODY_MAX:
+                    return self.reply(413)
+            records = flatten(json.loads(body), client_env, utc_iso(time.time()))
+        except (ValueError, OSError, EOFError, RecursionError, AttributeError, TypeError) as e:
+            log_err(f"otlp: bad request from {client_env}: {e}")
+            return self.reply(400)
+        logd.store_records("host", records, otel=True)
+        self.reply(200)
+
+
+class OTLPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, sock, logd):
+        # Use an already-bound listening socket (from systemd or the caller).
+        socketserver.BaseServer.__init__(self, sock.getsockname(), OTLPHandler)
+        self.socket = sock
+        self.server_name, self.server_port = "agent-logd", sock.getsockname()[1]
+        self.logd = logd
+
+
+# -----------------------------------------------------------------
+# Daemon
+# -----------------------------------------------------------------
+
+def listen_fds(environ, pid):
+    """systemd socket passing: [(fd, name)] from LISTEN_PID/LISTEN_FDS/
+    LISTEN_FDNAMES (fds start at 3)."""
+    if environ.get("LISTEN_PID") != str(pid):
+        return []
+    try:
+        count = int(environ.get("LISTEN_FDS", "0"))
+    except ValueError:
+        return []
+    names = environ.get("LISTEN_FDNAMES", "").split(":") if environ.get("LISTEN_FDNAMES") else []
+    return [(3 + i, names[i] if i < len(names) else "unknown") for i in range(count)]
+
+
+class Daemon:
+    def __init__(self, store, registry, allow_any_uid=False, vsock_allow_loopback=False,
+                 vsock_allow_unprivileged=False):
+        self.store = store
+        self.registry = registry
+        self.allow_any_uid = allow_any_uid
+        self.vsock_allow_loopback = vsock_allow_loopback
+        self.vsock_allow_unprivileged = vsock_allow_unprivileged
+
+    def store_records(self, env, records, otel=False):
+        for rec in records:
+            line_len = len(encode_json(rec))
+            if line_len > LINE_MAX:
+                digest = hashlib.sha256(encode_json(rec)).hexdigest()
+                rec = meta_record("oversize", f"oversize:{rec['source']}:{rec['source_id']}",
+                                  {"source": rec["source"], "source_id": rec["source_id"],
+                                   "length": line_len, "sha256": digest}, env, rec["recv_ts"])
+            self.store.append(env, rec, otel=otel)
+        self.store.sync()
+
+    def serve(self, sock, kind):
+        """Accept loop for one listening socket (kind: vsock, unix, otlp)."""
+        if kind == "otlp":
+            threading.Thread(target=OTLPServer(sock, self).serve_forever, daemon=True,
+                             name="otlp").start()
+            return
+        threading.Thread(target=self._accept, args=(sock, kind), daemon=True,
+                         name=f"accept-{kind}").start()
+
+    def _accept(self, sock, kind):
+        while True:
+            try:
+                conn, addr = sock.accept()
+            except OSError as e:
+                log_err(f"{kind}: accept failed: {e}")
+                time.sleep(0.5)
+                continue
+            threading.Thread(target=self._serve_conn, args=(conn, addr, kind), daemon=True).start()
+
+    def peer_env(self, conn, addr, kind):
+        if kind == "vsock":
+            cid, port = addr
+            return check_vsock_peer(cid, port, self.registry.cids(), self.vsock_allow_loopback,
+                                    self.vsock_allow_unprivileged)
+        _pid, uid, _gid = struct.unpack("3i", conn.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        return check_unix_peer(uid, self.allow_any_uid)
+
+    def _serve_conn(self, conn, addr, kind):
+        try:
+            env, reason = self.peer_env(conn, addr, kind)
+            if env is None:
+                log_err(f"{kind}: rejected peer {addr!r}: {reason}")
+                return
+            n = handle_ingest(conn, env, self.store)
+            log(f"{kind}: {env} disconnected after {n} records")
+        except (OSError, ValueError) as e:
+            log_err(f"{kind}: connection error: {e}")
+        finally:
+            conn.close()
+
+
+def bind_unix(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(path)
+    os.chmod(path, 0o600)
+    s.listen(64)
+    return s
+
+
+def bind_tcp(spec):
+    host, _, port = spec.rpartition(":")
+    host = host.strip("[]") or "127.0.0.1"
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    s = socket.socket(family, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, int(port)))
+    s.listen(64)
+    return s
+
+
+def bind_vsock(port):
+    s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    s.bind((socket.VMADDR_CID_ANY, port))
+    s.listen(64)
+    return s
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(description="Receive and store agent audit records.")
+    p.add_argument("--store", default=STORE)
+    p.add_argument("--envs-conf", default=ENVS_CONF)
+    p.add_argument("--quota", type=int, default=QUOTA, help="bytes per environment per day")
+    p.add_argument("--listen-unix", metavar="PATH", help="dev/test: bind an ingest unix socket")
+    p.add_argument("--listen-vsock", metavar="PORT", type=int, help="dev/test: bind vsock port")
+    p.add_argument("--listen-otlp", "--listen-tcp", metavar="HOST:PORT", action="append",
+                   default=[], help="dev/test: bind an OTLP/HTTP listener")
+    p.add_argument("--allow-any-uid", action="store_true",
+                   help="test only: accept non-root unix peers")
+    p.add_argument("--vsock-allow-loopback", action="store_true",
+                   help="test only: accept CID 1 when it is listed in envs.conf")
+    p.add_argument("--vsock-allow-unprivileged", action="store_true",
+                   help="test only: accept source ports above 1023")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    store = Store(args.store, args.quota)
+    registry = Registry(args.envs_conf)
+    registry.refresh()
+    daemon = Daemon(store, registry, args.allow_any_uid, args.vsock_allow_loopback,
+                    args.vsock_allow_unprivileged)
+    listeners = []
+    for fd, name in listen_fds(os.environ, os.getpid()):
+        listeners.append((socket.socket(fileno=fd), name))
+    for var in ("LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"):
+        os.environ.pop(var, None)
+    if args.listen_unix:
+        listeners.append((bind_unix(args.listen_unix), "unix"))
+    if args.listen_vsock is not None:
+        listeners.append((bind_vsock(args.listen_vsock), "vsock"))
+    for spec in args.listen_otlp:
+        listeners.append((bind_tcp(spec), "otlp"))
+    if not listeners:
+        log_err("no listening sockets (expected systemd socket activation or --listen-*)")
+        return 1
+    for sock, name in listeners:
+        if name not in ("vsock", "unix", "otlp"):
+            log_err(f"ignoring socket with unknown FileDescriptorName {name!r}")
+            continue
+        daemon.serve(sock, name)
+        log(f"listening: {name} {sock.getsockname()!r}")
+
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    signal.signal(signal.SIGHUP, lambda *_: registry.refresh())
+    stop.wait()
+    store.sync()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

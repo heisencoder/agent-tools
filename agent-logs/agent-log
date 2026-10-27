@@ -1,0 +1,890 @@
+#!/usr/bin/python3 -I
+# agent-log — query the agent audit store written by agent-logd.
+#
+# Reads /var/log/agent-audit/<env>/*.jsonl directly (no database), removes
+# duplicates on (env, source, source_id) (delivery is at-least-once), and
+# rebuilds per-session views (docs/design/implementation.md, "Correlation" and
+# "agent-log CLI and verify"):
+#
+#   agent-log sessions [--env E] [--since 2h]       sessions with counts
+#   agent-log timeline SESSION [--exec] [--net] [--transcript] [--otel] [--all]
+#   agent-log net [--denied] [--env E] [--since 1d] proxy decisions and drops
+#   agent-log exec SESSION                          process tree from auditd
+#   agent-log tail [--env E]                        follow new records
+#   agent-log verify [SESSION]                      consistency/tamper checks
+#
+# Every command takes --store DIR (default /var/log/agent-audit) and --json.
+# SESSION is a session_id prefix or a run ID.  Run as a member of the
+# agent-audit group (the administrator) or root.
+#
+# Correlation:
+#   exec -> session   same (env, boot_id, ses) inside the session's time
+#                     window; when several sessions share a ses, walk ppid up
+#                     to each session's claude_pid.  Unresolved: "ambiguous".
+#   net  -> session   records shipped by the host whose client_env is the
+#                     session's env, inside its window: "exact" when only one
+#                     session of that env is active, else "probable".
+#
+# Standard library only; Python >= 3.12.
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import sys
+import time
+from datetime import datetime, timezone
+
+STORE = "/var/log/agent-audit"
+CLAUDE_PREFIX = "/opt/claude-code/"
+HOOK_PATH = "/usr/local/lib/agent-audit/claude-audit-hook"
+# Allowed process shapes between a hook and its claude_pid: the exe
+# basenames of the intermediate ancestors, nearest first.  Observed with real
+# Claude Code 2.1.312: python3 (hook) <- /usr/bin/dash (`/bin/sh -c <hook
+# command>`) <- claude.  ("sh",) covers systems where /bin/sh is not dash.
+# The shape alone is forgeable (a Bash tool shell can `exec /bin/sh -c hook`),
+# so verify also checks the parent shell's exec history in auditd.
+HOOK_ANCESTRY_SHAPES = {("dash",), ("sh",)}
+# A Bash tool call runs `/bin/bash -c 'source …/shell-snapshots/… && eval …'`.
+BASH_TOOL_MARKER = "shell-snapshots"
+WINDOW_BEFORE = 2.0      # seconds before a session's first hook record
+WINDOW_AFTER_END = 5.0   # seconds after SessionEnd
+IDLE_GRACE = 300.0       # open window after the last record of an unended session
+# meta events that indicate lost or altered records.
+PIPELINE_EVENTS = {"quota-exceeded", "journal-suppressed", "transcript-rewritten",
+                   "spool-pruned", "audit-degraded", "oversize", "invalid-record",
+                   "audit-cursor-lost"}
+OUR_TABLES = ("agent_egress", "agent_vmnet")
+
+
+# -----------------------------------------------------------------
+# Loading
+# -----------------------------------------------------------------
+
+def parse_ts(value):
+    """ISO 8601 string -> epoch seconds, or None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def parse_since(text, now=None):
+    """'2h', '30m', '1d', '1w', '45s', or an ISO date/time -> epoch seconds."""
+    now = time.time() if now is None else now
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([smhdw])", text.strip())
+    if m:
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+        return now - float(m.group(1)) * mult
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"bad --since value {text!r} (try 2h, 1d, 2026-10-27)")
+    if dt.tzinfo is None:
+        dt = dt.astimezone()             # local time, as typed
+    return dt.timestamp()
+
+
+FILE_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})\.jsonl\Z")
+
+
+def store_files(store, since=None):
+    """[(env, path)] for every JSONL file, skipping days before `since`."""
+    out = []
+    try:
+        envs = sorted(os.listdir(store))
+    except OSError as e:
+        sys.exit(f"agent-log: cannot read store {store}: {e.strerror}")
+    cutoff = None
+    if since is not None:
+        cutoff = time.strftime("%Y-%m-%d", time.gmtime(since - 86400))
+    for env in envs:
+        directory = os.path.join(store, env)
+        if not os.path.isdir(directory):
+            continue
+        for name in sorted(os.listdir(directory)):
+            m = FILE_DATE_RE.search(name)
+            if not m or (cutoff and m.group(1) < cutoff):
+                continue
+            out.append((env, os.path.join(directory, name)))
+    return out
+
+
+def read_records(path):
+    try:
+        with open(path, "rb") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue          # e.g. a line still being written
+                if isinstance(rec, dict):
+                    yield rec
+    except OSError as e:
+        print(f"agent-log: {path}: {e.strerror}", file=sys.stderr)
+
+
+def record_time(rec):
+    t = parse_ts(rec.get("ts"))
+    return t if t is not None else (parse_ts(rec.get("recv_ts")) or 0.0)
+
+
+def load(store, since=None):
+    """All records, de-duplicated on (env, source, source_id), time-ordered.
+    Each gets an internal "_t" (epoch seconds), stripped from JSON output."""
+    seen, out = set(), []
+    for _env, path in store_files(store, since):
+        for rec in read_records(path):
+            key = (rec.get("env"), rec.get("source"), rec.get("source_id"))
+            if rec.get("source_id") is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            rec["_t"] = record_time(rec)
+            out.append(rec)
+    out.sort(key=lambda r: (r["_t"], r.get("recv_ts") or ""))
+    return out
+
+
+def public(rec):
+    return {k: v for k, v in rec.items() if not k.startswith("_")}
+
+
+# auid/ses value meaning "not set" (a process that never logged in, e.g. a daemon).
+UNSET_ID = 4294967295
+
+def hook_parts(rec):
+    data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+    obs = data.get("observed") if isinstance(data.get("observed"), dict) else {}
+    ev = data.get("event") if isinstance(data.get("event"), dict) else {}
+    return obs, ev
+
+
+def is_exec(rec):
+    return rec.get("source") == "audit" and rec.get("event") == "exec"
+
+
+def is_net(rec):
+    # Only the host ships proxy decisions and firewall drops; anything a VM
+    # sends under these sources is its own claim and is not correlated.
+    return rec.get("source") in ("egress", "netfilter") and rec.get("env") == "host"
+
+
+def is_denied(rec):
+    if rec.get("source") == "netfilter":
+        return True
+    data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+    return data.get("decision") == "deny"
+
+
+# -----------------------------------------------------------------
+# Sessions and correlation
+# -----------------------------------------------------------------
+
+class Session:
+    def __init__(self, env, session_id):
+        self.env = env
+        self.session_id = session_id
+        self.hooks = []
+        self.execs = []          # (rec, match)
+        self.net = []            # (rec, match)
+        self.keys = set()        # (boot_id, ses)
+        self.claude_pids = set()  # (boot_id, ses, pid)
+
+    def add(self, rec):
+        self.hooks.append(rec)
+        obs, _ = hook_parts(rec)
+        if rec.get("ses") is not None:
+            self.keys.add((rec.get("boot_id"), rec.get("ses")))
+            if obs.get("claude_pid"):
+                self.claude_pids.add((rec.get("boot_id"), rec.get("ses"), obs["claude_pid"]))
+
+    @property
+    def start(self):
+        return self.hooks[0]["_t"]
+
+    @property
+    def last(self):
+        return self.hooks[-1]["_t"]
+
+    @property
+    def ended(self):
+        return any(r.get("event") == "SessionEnd" for r in self.hooks)
+
+    @property
+    def window(self):
+        if self.hooks[-1].get("event") == "SessionEnd":
+            end = self.last + WINDOW_AFTER_END
+        else:
+            end = self.last + IDLE_GRACE
+        return self.start - WINDOW_BEFORE, end
+
+    def contains(self, t):
+        lo, hi = self.window
+        return lo <= t <= hi
+
+    def first(self, field):
+        for rec in self.hooks:
+            obs, ev = hook_parts(rec)
+            value = rec.get(field) if field in rec else None
+            if value is None:
+                value = ev.get(field) if field in ev else obs.get(field)
+            if value is not None:
+                return value
+        return None
+
+    def tools(self):
+        return sum(1 for r in self.hooks if r.get("event") == "PreToolUse")
+
+    def summary(self):
+        lo, hi = self.window
+        return {"env": self.env, "session_id": self.session_id, "run_id": self.first("run_id"),
+                "start": self.hooks[0].get("ts"), "last": self.hooks[-1].get("ts"),
+                "ended": self.ended, "ses": sorted({k[1] for k in self.keys}),
+                "claude_exe": self.first("claude_exe"), "cwd": self.first("cwd"),
+                "tools": self.tools(), "execs": len(self.execs),
+                "denies": sum(1 for r, _ in self.net if is_denied(r)),
+                "net": len(self.net)}
+
+
+def build_sessions(records):
+    sessions = {}
+    for rec in records:
+        if rec.get("source") == "hook" and isinstance(rec.get("session_id"), str):
+            key = (rec.get("env"), rec["session_id"])
+            if key not in sessions:
+                sessions[key] = Session(*key)
+            sessions[key].add(rec)
+    out = sorted(sessions.values(), key=lambda s: s.start)
+    correlate(out, records)
+    return out
+
+
+def parent_map(records):
+    """(env, boot_id, ses) -> {pid: ppid} from exec records and hook ancestry."""
+    parents = {}
+    for rec in records:
+        group = (rec.get("env"), rec.get("boot_id"), rec.get("ses"))
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        if is_exec(rec) and data.get("pid") is not None:
+            parents.setdefault(group, {})[data["pid"]] = data.get("ppid")
+        elif rec.get("source") == "hook":
+            obs, _ = hook_parts(rec)
+            anc = obs.get("ancestry") or []
+            for child, parent in zip(anc, anc[1:]):
+                parents.setdefault(group, {})[child.get("pid")] = parent.get("pid")
+    return parents
+
+
+def correlate(sessions, records):
+    by_key, by_env = {}, {}
+    for s in sessions:
+        for boot, ses in s.keys:
+            by_key.setdefault((s.env, boot, ses), []).append(s)
+        by_env.setdefault(s.env, []).append(s)
+    parents = parent_map(records)
+
+    for rec in records:
+        if is_exec(rec):
+            group = (rec.get("env"), rec.get("boot_id"), rec.get("ses"))
+            cands = [s for s in by_key.get(group, []) if s.contains(rec["_t"])]
+            if len(cands) == 1:
+                cands[0].execs.append((rec, "exact"))
+            elif cands:
+                owner = walk_to_claude(rec, cands, parents.get(group, {}))
+                if owner:
+                    owner.execs.append((rec, "exact"))
+                else:
+                    for s in cands:
+                        s.execs.append((rec, "ambiguous"))
+        elif is_net(rec) and rec.get("client_env"):
+            cands = [s for s in by_env.get(rec["client_env"], []) if s.contains(rec["_t"])]
+            for s in cands:
+                s.net.append((rec, "exact" if len(cands) == 1 else "probable"))
+
+
+def walk_to_claude(rec, cands, parents):
+    pid = (rec.get("data") or {}).get("pid")
+    claude = {}
+    for s in cands:
+        for boot, ses, cpid in s.claude_pids:
+            if (boot, ses) == (rec.get("boot_id"), rec.get("ses")):
+                claude[cpid] = s
+    seen = set()
+    while pid and pid not in seen and len(seen) < 256:
+        if pid in claude:
+            return claude[pid]
+        seen.add(pid)
+        pid = parents.get(pid)
+    return None
+
+
+def find_session(sessions, ident):
+    exact = [s for s in sessions if s.session_id == ident or s.first("run_id") == ident]
+    if exact:
+        return exact[0] if len(exact) == 1 else ambiguous(ident, exact)
+    matches = [s for s in sessions if s.session_id.startswith(ident)]
+    if not matches:
+        sys.exit(f"agent-log: no session matches {ident!r}")
+    if len(matches) > 1:
+        ambiguous(ident, matches)
+    return matches[0]
+
+
+def ambiguous(ident, matches):
+    lines = "\n".join(f"  {s.env}  {s.session_id}" for s in matches)
+    sys.exit(f"agent-log: {ident!r} matches several sessions:\n{lines}")
+
+
+# -----------------------------------------------------------------
+# Formatting
+# -----------------------------------------------------------------
+
+def fmt_time(t, date=False):
+    lt = time.localtime(t)
+    base = time.strftime("%Y-%m-%d %H:%M:%S" if date else "%H:%M:%S", lt)
+    return base if date else f"{base}.{int((t % 1) * 1000):03d}"
+
+
+def clip(text, width):
+    text = re.sub(r"[\r\n\t\v\f]+", " ", str(text))
+    return text if len(text) <= width else text[: max(width - 1, 0)] + "…"
+
+
+def tool_brief(name, tool_input):
+    if not isinstance(tool_input, dict):
+        return name or ""
+    for key in ("command", "file_path", "path", "pattern", "url", "query", "description",
+                "prompt", "notebook_path"):
+        if isinstance(tool_input.get(key), str):
+            return f"{name}: {tool_input[key]}"
+    return f"{name}: {json.dumps(tool_input, ensure_ascii=False)}"
+
+
+def summarize(rec):
+    """One-line human summary of any record."""
+    src, event = rec.get("source"), rec.get("event")
+    data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+    if src == "hook":
+        _, ev = hook_parts(rec)
+        if event in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
+            text = tool_brief(ev.get("tool_name"), ev.get("tool_input"))
+            if event == "PostToolUseFailure" and ev.get("error"):
+                text += f"  error: {ev['error']}"
+            return text
+        if event == "UserPromptSubmit":
+            return f"prompt: {ev.get('prompt', '')}"
+        if event == "SessionStart":
+            return f"source={ev.get('source')} model={ev.get('model')} cwd={ev.get('cwd')}"
+        if event in ("SubagentStart", "SubagentStop"):
+            return f"{ev.get('agent_type')} {ev.get('agent_id')}"
+        if event == "SessionEnd":
+            return f"reason={ev.get('reason')}"
+        return ""
+    if src == "audit":
+        if event == "exec":
+            argv = data.get("argv") or []
+            ok = "" if data.get("success") is not False else "  [failed]"
+            return f"{shlex.join(argv) if argv else data.get('exe')}  (pid {data.get('pid')} " \
+                   f"ppid {data.get('ppid')} cwd {data.get('cwd')}){ok}"
+        if event in ("netfilter-cfg", "config-change"):
+            recs = data.get("records") or [{}]
+            return " ".join(f"{k}={v}" for k, v in recs[0].items() if k in
+                            ("type", "table", "op", "family", "entries", "key", "auid"))
+        paths = ",".join(p.get("name") or "" for p in data.get("paths") or [])
+        return f"{data.get('key')} {data.get('exe')} {paths}"
+    if src == "egress":
+        reason = f" ({data.get('reason')})" if data.get("reason") else ""
+        return f"{str(data.get('decision', '?')).upper()} {data.get('method')} " \
+               f"{data.get('host')}:{data.get('port')}{reason} from {rec.get('client_env')}"
+    if src == "netfilter":
+        f = data.get("fields") or {}
+        return f"DROP {data.get('prefix')} {f.get('proto')} {f.get('src')} -> " \
+               f"{f.get('dst')}:{f.get('dpt')} from {rec.get('client_env')}"
+    if src == "transcript":
+        line = data.get("line") if isinstance(data.get("line"), dict) else {}
+        return f"{line.get('type', event)} {data.get('path')}"
+    if src == "otel":
+        attrs = data.get("attributes") or {}
+        keys = ("model", "cost_usd", "input_tokens", "output_tokens", "tool_name", "duration_ms")
+        return " ".join(f"{k}={attrs[k]}" for k in keys if k in attrs) or str(data.get("value", ""))
+    if src == "meta":
+        return json.dumps(data, ensure_ascii=False)
+    return ""
+
+
+def print_json(obj):
+    json.dump(obj, sys.stdout, indent=2, ensure_ascii=False, default=str)
+    sys.stdout.write("\n")
+
+
+def width():
+    return shutil.get_terminal_size((120, 24)).columns
+
+
+# -----------------------------------------------------------------
+# Commands
+# -----------------------------------------------------------------
+
+def cmd_sessions(args, records):
+    sessions = build_sessions(records)
+    if args.env:
+        sessions = [s for s in sessions if s.env == args.env]
+    if args.since is not None:
+        sessions = [s for s in sessions if s.last >= args.since]
+    if args.json:
+        return print_json([s.summary() for s in sessions])
+    if not sessions:
+        print("no sessions")
+        return 0
+    print(f"{'START':19}  {'ENV':14} {'SESSION':10} {'SES':>5} {'TOOLS':>5} {'EXECS':>5} "
+          f"{'DENY':>4}  {'STATE':7} CWD")
+    for s in sessions:
+        sm = s.summary()
+        ses = ",".join(str(x) for x in sm["ses"]) or "-"
+        state = "ended" if s.ended else "open"
+        print(f"{fmt_time(s.start, True):19}  {s.env:14} {s.session_id[:8]:10} {ses:>5} "
+              f"{sm['tools']:>5} {sm['execs']:>5} {sm['denies']:>4}  {state:7} {sm['cwd'] or ''}")
+    return 0
+
+
+def timeline_items(s, records, args):
+    items = [(r, None) for r in s.hooks]
+    if args.exec or args.all:
+        items += s.execs
+    if args.net or args.all:
+        items += s.net
+    if args.transcript or args.otel or args.all:
+        want = set()
+        if args.transcript or args.all:
+            want.add("transcript")
+        if args.otel or args.all:
+            want.add("otel")
+        items += [(r, None) for r in records
+                  if r.get("source") in want and r.get("session_id") == s.session_id
+                  and (r.get("source") == "otel" or r.get("env") == s.env)]
+    if args.all:
+        items += [(r, None) for r in records if r.get("source") == "meta"
+                  and r.get("env") == s.env and s.contains(r["_t"])]
+    items.sort(key=lambda it: it[0]["_t"])
+    return items
+
+
+def cmd_timeline(args, records):
+    sessions = build_sessions(records)
+    s = find_session(sessions, args.session)
+    items = timeline_items(s, records, args)
+    if args.json:
+        return print_json([dict(public(r), match=m) if m else public(r) for r, m in items])
+    sm = s.summary()
+    print(f"session {s.session_id}  env={s.env}  run={sm['run_id']}  ses={sm['ses']}  "
+          f"claude={sm['claude_exe']}")
+    w = width()
+    for rec, match in items:
+        tag = f" [{match}]" if match and match != "exact" else ""
+        head = f"{fmt_time(rec['_t'])}  {rec.get('source', ''):10} {rec.get('event', ''):18} "
+        print(head + clip(summarize(rec) + tag, max(w - len(head), 20)))
+    return 0
+
+
+def cmd_net(args, records):
+    rows = [r for r in records if is_net(r)]
+    if args.denied:
+        rows = [r for r in rows if is_denied(r)]
+    if args.env:
+        rows = [r for r in rows if r.get("client_env") == args.env]
+    if args.since is not None:
+        rows = [r for r in rows if r["_t"] >= args.since]
+    if args.json:
+        return print_json([public(r) for r in rows])
+    w = width()
+    for r in rows:
+        head = f"{fmt_time(r['_t'], True)}  {str(r.get('client_env')):14} "
+        print(head + clip(summarize(r), max(w - len(head), 20)))
+    if not rows:
+        print("no matching network records")
+    return 0
+
+
+def cmd_exec(args, records):
+    sessions = build_sessions(records)
+    s = find_session(sessions, args.session)
+    execs = sorted(s.execs, key=lambda it: it[0]["_t"])
+    if args.json:
+        return print_json([dict(public(r), match=m) for r, m in execs])
+    by_pid, children = {}, {}
+    for rec, match in execs:
+        d = rec.get("data") or {}
+        by_pid.setdefault(d.get("pid"), []).append((rec, match))
+    for pid, entries in by_pid.items():
+        ppid = (entries[0][0].get("data") or {}).get("ppid")
+        children.setdefault(ppid, []).append(pid)
+    claude = sorted({pid for _, _, pid in s.claude_pids})
+    roots = [p for p in claude if p not in by_pid]
+    roots += [p for p in by_pid if (by_pid[p][0][0].get("data") or {}).get("ppid")
+              not in by_pid and (by_pid[p][0][0].get("data") or {}).get("ppid") not in roots]
+    w = width()
+
+    def show(pid, prefix, last, depth):
+        branch = "" if depth == 0 else ("└─ " if last else "├─ ")
+        if pid in by_pid:
+            texts = []
+            for rec, match in by_pid[pid]:
+                d = rec.get("data") or {}
+                argv = d.get("argv") or [d.get("exe") or "?"]
+                tag = " [ambiguous]" if match == "ambiguous" else ""
+                texts.append(shlex.join(str(a) for a in argv) + tag)
+            label = f"{pid} " + " ⇒ ".join(texts)
+        else:
+            label = f"{pid} claude (session root)"
+        line = prefix + branch + label
+        print(clip(line, w))
+        kids = sorted(children.get(pid, []), key=lambda p: by_pid[p][0][0]["_t"])
+        ext = "" if depth == 0 else ("   " if last else "│  ")
+        for i, kid in enumerate(kids):
+            if kid != pid:
+                show(kid, prefix + ext, i == len(kids) - 1, depth + 1)
+
+    printed = set()
+    for root in dict.fromkeys(roots):
+        if root not in printed:
+            printed.add(root)
+            show(root, "", True, 0)
+    if not execs:
+        print("no exec records for this session")
+    return 0
+
+
+def follow_targets(store, env_filter):
+    """Newest file per environment directory (both kinds)."""
+    latest = {}
+    for env, path in store_files(store):
+        if env_filter and env != env_filter:
+            continue
+        kind = (env, os.path.basename(path).startswith("otel-"))
+        latest[kind] = path
+    return set(latest.values())
+
+
+def cmd_tail(args, _records):
+    offsets = {}
+    for path in follow_targets(args.store, args.env):
+        offsets[path] = 0 if args.from_start else os.path.getsize(path)
+    w = width()
+    try:
+        while True:
+            for path in follow_targets(args.store, args.env):
+                offsets.setdefault(path, 0)
+            for path in sorted(offsets):
+                try:
+                    with open(path, "rb") as f:
+                        f.seek(offsets[path])
+                        data = f.read()
+                except OSError:
+                    continue
+                end = data.rfind(b"\n") + 1
+                offsets[path] += end
+                for line in data[:end].splitlines():
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if args.json:
+                        print(json.dumps(rec, ensure_ascii=False), flush=True)
+                        continue
+                    t = record_time(rec)
+                    head = f"{fmt_time(t)}  {str(rec.get('env')):12} {rec.get('source', ''):10} " \
+                           f"{rec.get('event', ''):18} "
+                    print(head + clip(summarize(rec), max(w - len(head), 20)), flush=True)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        return 0
+
+
+# --- verify ------------------------------------------------------------------
+
+def exe_basename(exe):
+    exe = exe or ""
+    if exe.endswith(" (deleted)"):
+        exe = exe[: -len(" (deleted)")]
+    return os.path.basename(exe)
+
+
+def hook_shape_ok(obs):
+    """Does a hook record's observed ancestry look like Claude Code spawning
+    the hook (and not, e.g., a Bash tool shell running it)?"""
+    if HOOK_PATH not in (obs.get("cmdline") or []):
+        return False, "hook process is not " + HOOK_PATH
+    anc = obs.get("ancestry") or []
+    pids = [a.get("pid") for a in anc]
+    if obs.get("claude_pid") not in pids:
+        return False, "claude_pid not in ancestry"
+    shape = tuple(exe_basename(a.get("exe")) for a in anc[1:pids.index(obs["claude_pid"])])
+    if shape not in HOOK_ANCESTRY_SHAPES:
+        return False, "intermediate processes " + (" > ".join(shape) or "none")
+    return True, ""
+
+
+def exec_index(records):
+    """(env, boot_id, ses, pid) -> exec records of that pid, time-ordered."""
+    index, audited = {}, set()
+    for rec in records:
+        if is_exec(rec):
+            group = (rec.get("env"), rec.get("boot_id"), rec.get("ses"))
+            audited.add(group)
+            index.setdefault(group + ((rec.get("data") or {}).get("pid"),), []).append(rec)
+    return index, audited
+
+
+def hook_parent_check(rec, s, index, audited):
+    """Check a hook record's parent shell against auditd (verify: origin).
+
+    Genuine: the parent PID exec'd exactly once in this session, as sh/dash,
+    with ppid = claude_pid.  Forged via a Bash tool call: the same PID first
+    exec'd /usr/bin/bash (argv mentions shell-snapshots), then /bin/sh.
+    -> ("ok" | "suspect" | "unverifiable", reason)"""
+    obs, _ = hook_parts(rec)
+    anc = obs.get("ancestry") or []
+    group = (rec.get("env"), rec.get("boot_id"), rec.get("ses"))
+    if group not in audited:
+        return "unverifiable", "no exec audit records for this session"
+    if len(anc) < 2:
+        return "unverifiable", "no parent in observed ancestry"
+    parent = anc[1].get("pid")
+    lo, _ = s.window
+    execs = [r for r in index.get(group + (parent,), []) if lo <= r["_t"] <= rec["_t"] + 1]
+    if not execs:
+        return "unverifiable", f"no exec record for parent pid {parent}"
+    for r in execs:
+        d = r.get("data") or {}
+        if exe_basename(d.get("exe")) == "bash" or any(
+                BASH_TOOL_MARKER in str(a) for a in d.get("argv") or []):
+            return "suspect", f"parent pid {parent} was a Bash tool shell before exec'ing sh"
+    d = execs[-1].get("data") or {}
+    if len(execs) != 1 or exe_basename(d.get("exe")) not in ("sh", "dash") \
+            or d.get("ppid") != obs.get("claude_pid"):
+        return "suspect", f"parent pid {parent}: {len(execs)} exec(s), last {d.get('exe')} " \
+                          f"ppid {d.get('ppid')} (claude_pid {obs.get('claude_pid')})"
+    return "ok", ""
+
+
+def unhooked_claude(rec):
+    """An exec of something named claude that is not the root-owned install."""
+    d = rec.get("data") or {}
+    argv0 = exe_basename((d.get("argv") or [""])[0])
+    named = exe_basename(d.get("exe")) == "claude" or argv0 == "claude"
+    return named and not (d.get("exe") or "").startswith(CLAUDE_PREFIX)
+
+
+def is_table_removal(rec):
+    for r in (rec.get("data") or {}).get("records") or []:
+        if r.get("type") == "NETFILTER_CFG" and "unregister" in str(r.get("op", "")) \
+                and str(r.get("table", "")).split(":")[0] in OUR_TABLES:
+            return True
+    return False
+
+
+def finding(level, check, message):
+    return {"level": level, "check": check, "message": message}
+
+
+def verify_session(s, records):
+    out = []
+    hooks = s.hooks
+    # Binary
+    exes = {hook_parts(r)[0].get("claude_exe") for r in hooks}
+    bad = sorted(str(e) for e in exes if not (e or "").startswith(CLAUDE_PREFIX))
+    out.append(finding("FAIL", "binary", f"claude_exe outside {CLAUDE_PREFIX}: {', '.join(bad)}")
+               if bad else finding("ok", "binary", ", ".join(sorted(exes))))
+    # Completeness
+    pre = {hook_parts(r)[1].get("tool_use_id") for r in hooks if r.get("event") == "PreToolUse"}
+    post = {hook_parts(r)[1].get("tool_use_id") for r in hooks
+            if r.get("event") in ("PostToolUse", "PostToolUseFailure")}
+    missing = sorted(str(x) for x in pre - post)
+    problems = []
+    if missing:
+        problems.append(f"{len(missing)} PreToolUse without PostToolUse ({', '.join(missing[:5])})")
+    if not s.ended:
+        problems.append("no SessionEnd (still running, killed, or lost)")
+    out.append(finding("WARN", "completeness", "incomplete: " + "; ".join(problems))
+               if problems else finding("ok", "completeness", f"{len(pre)} tool calls, ended"))
+    # Origin of hook records
+    shapes = [hook_shape_ok(hook_parts(r)[0]) for r in hooks]
+    odd = [why for ok, why in shapes if not ok]
+    out.append(finding("FAIL", "origin", f"{len(odd)} of {len(hooks)} hook records have an "
+                       f"unexpected ancestry (e.g. {odd[0]})") if odd
+               else finding("ok", "origin", f"{len(hooks)} hook records"))
+    # Origin, part 2: the parent shell's exec history in auditd
+    index, audited = exec_index(records)
+    results = [hook_parent_check(r, s, index, audited) for r in hooks]
+    suspects = [why for verdict, why in results if verdict == "suspect"]
+    unverifiable = [why for verdict, why in results if verdict == "unverifiable"]
+    if suspects:
+        out.append(finding("FAIL", "forged-hook", f"forged-hook-suspect: {len(suspects)} hook "
+                           f"record(s), e.g. {suspects[0]}"))
+    elif unverifiable:
+        out.append(finding("WARN", "hook-parent", f"unverifiable for {len(unverifiable)} of "
+                           f"{len(hooks)} hook records (e.g. {unverifiable[0]})"))
+    else:
+        out.append(finding("ok", "hook-parent", "every hook's parent shell was spawned by claude"))
+    # Injection
+    loaders = [hook_parts(r)[0].get("loader_env", None) for r in hooks]
+    injected = [env for env in loaders if env]
+    unknown = sum(1 for env in loaders if env is None)
+    if injected:
+        out.append(finding("FAIL", "injection", f"loader variables set in {len(injected)} hook "
+                           f"records: {sorted(set(k for e in injected for k in e))}"))
+    elif unknown:
+        out.append(finding("WARN", "injection", f"environment unreadable for {unknown} hook records"))
+    else:
+        out.append(finding("ok", "injection", "loader_env empty"))
+    # Policy, unhooked claude binaries and pipeline health inside the window
+    envs = {s.env, "host"}
+    near = [r for r in records if r.get("env") in envs and s.contains(r["_t"])]
+    out += window_checks(near, s.env, agent_identities(hooks))
+    return out
+
+
+def agent_identities(hook_records):
+    """UIDs and (env, boot_id, ses) audit sessions seen in hook records: the agent's own."""
+    uids, sessions = set(), set()
+    for r in hook_records:
+        obs = hook_parts(r)[0]
+        uids.update(u for u in (obs.get("uid"), obs.get("auid")) if u not in (None, 0, UNSET_ID))
+        if r.get("ses") not in (None, UNSET_ID):
+            sessions.add((r.get("env"), r.get("boot_id"), r.get("ses")))
+    return uids, sessions
+
+
+def by_agent(rec, identities):
+    """Whether a policy change traces back to the agent (its login UID or audit session)."""
+    uids, sessions = identities
+    return (rec.get("auid") in uids or rec.get("uid") in uids or
+            (rec.get("env"), rec.get("boot_id"), rec.get("ses")) in sessions)
+
+
+def window_checks(recs, env=None, identities=(frozenset(), frozenset())):
+    out = []
+    policy = [r for r in recs if r.get("source") == "audit" and r.get("event") == "policy"]
+    tables = [r for r in recs if r.get("source") == "audit" and is_table_removal(r)]
+    rules = [r for r in recs if r.get("event") == "config-change" and any(
+        "remove" in str(x.get("op", "")) for x in (r.get("data") or {}).get("records") or [])]
+    if policy or tables:
+        what = [f"{len(policy)} agent-policy write(s)"] if policy else []
+        what += [f"{len(tables)} removal(s) of {'/'.join(OUR_TABLES)}"] if tables else []
+        # The agent cannot change policy without a privilege escalation, and
+        # its login UID and audit session survive one.  Anything else is the
+        # administrator (an install or a firewall reload) and only worth a WARN.
+        agent = [r for r in policy + tables if by_agent(r, identities)]
+        if agent:
+            out.append(finding("FAIL", "policy", "; ".join(what) +
+                               f"; {len(agent)} made from the agent's login or session"))
+        else:
+            out.append(finding("WARN", "policy", "; ".join(what) +
+                               " by another login (administrator maintenance?)"))
+    elif rules:
+        out.append(finding("WARN", "policy", f"{len(rules)} audit rule removal(s)"))
+    else:
+        out.append(finding("ok", "policy", "no policy changes"))
+    rogue = [r for r in recs if is_exec(r) and (env is None or r.get("env") == env)
+             and unhooked_claude(r)]
+    out.append(finding("FAIL", "unhooked-claude", f"{len(rogue)} exec(s) of a claude binary outside "
+                       f"{CLAUDE_PREFIX}, e.g. {(rogue[0].get('data') or {}).get('exe')}")
+               if rogue else finding("ok", "unhooked-claude", "none"))
+    meta = [r for r in recs if r.get("source") == "meta" and (
+        r.get("event") in PIPELINE_EVENTS or
+        (r.get("event") == "pipeline-log" and ((r.get("data") or {}).get("priority") or 9) <= 3))]
+    if meta:
+        counts = {}
+        for r in meta:
+            counts[r.get("event")] = counts.get(r.get("event"), 0) + 1
+        out.append(finding("WARN", "pipeline", ", ".join(f"{k} x{v}" for k, v in sorted(counts.items()))))
+    else:
+        out.append(finding("ok", "pipeline", "no loss or rewrite reports"))
+    return out
+
+
+def cmd_verify(args, records):
+    sessions = build_sessions(records)
+    if args.session:
+        targets = [find_session(sessions, args.session)]
+    else:
+        targets = [s for s in sessions if args.env is None or s.env == args.env]
+    report = []
+    for s in targets:
+        report.append({"session": s.summary(), "findings": verify_session(s, records)})
+    if not args.session:
+        scope = [r for r in records if args.env is None or r.get("env") in (args.env, "host")]
+        hooks = [r for r in scope if r.get("source") == "hook"]
+        report.append({"session": None,
+                       "findings": window_checks(scope, args.env, agent_identities(hooks))})
+    failed = any(f["level"] == "FAIL" for item in report for f in item["findings"])
+    if args.json:
+        print_json(report)
+        return 1 if failed else 0
+    for item in report:
+        sm = item["session"]
+        if sm:
+            t0, t1 = parse_ts(sm["start"]) or 0, parse_ts(sm["last"]) or 0
+            print(f"session {sm['session_id']}  env={sm['env']}  run={sm['run_id']}  "
+                  f"{fmt_time(t0, True)} → {fmt_time(t1, True)}")
+        else:
+            print("whole store" + (f" (env {args.env})" if args.env else ""))
+        for f in item["findings"]:
+            print(f"  {f['level']:5} {f['check']:16} {f['message']}")
+    print("FAIL" if failed else "OK")
+    return 1 if failed else 0
+
+
+# -----------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------
+
+def parse_args(argv):
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--store", default=STORE, help=f"store directory (default {STORE})")
+    common.add_argument("--json", action="store_true", help="machine-readable output")
+    common.add_argument("--since", type=parse_since, help="e.g. 2h, 1d, 2026-10-27")
+    p = argparse.ArgumentParser(prog="agent-log", description="Query the agent audit store.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sp = sub.add_parser("sessions", parents=[common], help="list sessions")
+    sp.add_argument("--env")
+    sp = sub.add_parser("timeline", parents=[common], help="merged view of one session")
+    sp.add_argument("session")
+    for flag in ("exec", "net", "transcript", "otel", "all"):
+        sp.add_argument(f"--{flag}", action="store_true")
+    sp = sub.add_parser("net", parents=[common], help="proxy decisions and firewall drops")
+    sp.add_argument("--denied", action="store_true")
+    sp.add_argument("--env", help="environment the traffic came from (client_env)")
+    sp = sub.add_parser("exec", parents=[common], help="process tree of one session")
+    sp.add_argument("session")
+    sp = sub.add_parser("tail", parents=[common], help="follow new records")
+    sp.add_argument("--env")
+    sp.add_argument("--from-start", action="store_true", help="print existing records first")
+    sp = sub.add_parser("verify", parents=[common], help="consistency and tamper checks")
+    sp.add_argument("session", nargs="?")
+    sp.add_argument("--env")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    commands = {"sessions": cmd_sessions, "timeline": cmd_timeline, "net": cmd_net,
+                "exec": cmd_exec, "tail": cmd_tail, "verify": cmd_verify}
+    # --since also skips whole day files older than (since - 1 day).
+    records = [] if args.cmd == "tail" else load(args.store, args.since)
+    try:
+        return commands[args.cmd](args, records) or 0
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

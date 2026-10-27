@@ -1,0 +1,837 @@
+#!/usr/bin/python3 -I
+# agent-egress-proxy — Allowlisting HTTP forward proxy for coding agents.
+#
+# Agents (on the host and in VMs) reach the internet only through this proxy;
+# host firewall rules drop everything else.  For each client connection it:
+#
+#   1. Identifies the client's environment from the listener it arrived on
+#      (127.0.0.1 → "host"; any other listener → VM IP looked up in envs.conf).
+#   2. Accepts only "CONNECT host:443" or absolute-URI "GET/HEAD http://host/…".
+#   3. Normalizes the host (lowercase, no trailing dot, IDNA) and rejects IP
+#      literals.
+#   4. Checks the host against the allowlist and the port (443 / 80).
+#   5. Resolves the name, rejects any non-global address (after unwrapping
+#      IPv4-mapped, 6to4, and NAT64 forms), and connects to that exact address.
+#   6. CONNECT: replies 200, reads the TLS ClientHello, and requires its SNI
+#      to equal the CONNECT host and no ECH extension, before contacting the
+#      upstream.  Plain HTTP: rewrites Host, strips Proxy-* headers, forces
+#      Connection: close, and forwards a single request.
+#   7. Logs one JSON line per connection to stdout (→ journald).
+#
+# Listeners come from systemd socket activation (LISTEN_FDS) and/or --listen.
+# SIGHUP reloads the allowlist and envs.conf.  Standard library only.
+#
+# Spec: docs/design/implementation.md, "Egress proxy".
+#
+# Usage:
+#   agent-egress-proxy [--allowlist-dir DIR] [--envs-conf FILE]
+#                      [--listen ADDR:PORT[=host|vm]]...
+
+import argparse
+import asyncio
+import collections
+import datetime
+import ipaddress
+import json
+import os
+import re
+import signal
+import socket
+import sys
+import time
+from pathlib import Path
+
+# -----------------------------------------------------------------
+# Defaults and limits
+# -----------------------------------------------------------------
+DEFAULT_ALLOWLIST_DIR = "/etc/agent-egress/allowlist.d"
+DEFAULT_ENVS_CONF = "/etc/agent-tools/envs.conf"
+
+CONNECT_PORT = 443              # the only port allowed for CONNECT
+HTTP_PORT = 80                  # the only port allowed for plain HTTP
+HEADER_TIMEOUT = 30.0           # seconds to receive the request head
+HEADER_MAX = 64 * 1024          # bytes of request head
+CLIENT_HELLO_TIMEOUT = 5.0      # seconds to receive the TLS ClientHello
+CLIENT_HELLO_MAX = 16 * 1024    # bytes of ClientHello handshake message
+IDLE_TIMEOUT = 600.0            # seconds without traffic before a tunnel closes
+RESOLVE_TIMEOUT = 10.0
+UPSTREAM_CONNECT_TIMEOUT = 10.0
+MAX_CONNS_PER_CLIENT = 64
+LOG_FIELD_MAX = 256             # truncate client-supplied strings in the log
+
+TLS_HANDSHAKE = 22
+TLS_CLIENT_HELLO = 1
+EXT_SERVER_NAME = 0x0000
+EXT_ECH = 0xFE0D
+
+STATUS_TEXT = {
+    400: "Bad Request", 403: "Forbidden", 405: "Method Not Allowed",
+    408: "Request Timeout", 429: "Too Many Requests",
+    431: "Request Header Fields Too Large", 502: "Bad Gateway",
+}
+
+
+class Deny(Exception):
+    """A request is refused.  `status` is the HTTP status to send, or None to
+    close without a response (e.g. after "200 Connection Established")."""
+
+    def __init__(self, reason, status=403):
+        super().__init__(reason)
+        self.reason = reason
+        self.status = status
+
+
+class ConfigError(Exception):
+    pass
+
+
+def warn(msg):
+    """Operational messages go to stderr as plain text; stdout carries only
+    JSON decision lines."""
+    print(f"agent-egress-proxy: {msg}", file=sys.stderr, flush=True)
+
+
+# -----------------------------------------------------------------
+# Host names
+# -----------------------------------------------------------------
+_LABEL_RE = re.compile(r"[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?")
+# Numeric final labels are IPv4 in disguise: inet_aton() accepts "127.1",
+# "0x7f.1", and "2130706433", and getaddrinfo() would return them unresolved.
+_NUMERIC_LABEL_RE = re.compile(r"0x[0-9a-f]*|[0-9]+")
+
+
+def normalize_host(raw):
+    """Return the canonical ASCII form of a host name, or raise Deny.
+
+    Lowercase, strip one trailing dot, convert Unicode to IDNA (punycode),
+    and refuse IP literals in any spelling."""
+    host = raw.lower()
+    if host.endswith("."):
+        host = host[:-1]
+    if not host:
+        raise Deny("bad-host", 400)
+    if ":" in host or host.startswith("["):
+        raise Deny("ip-literal")
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            raise Deny("bad-host", 400) from None
+    labels = host.split(".")
+    if len(host) > 253 or not all(_LABEL_RE.fullmatch(lab) for lab in labels):
+        raise Deny("bad-host", 400)
+    if _NUMERIC_LABEL_RE.fullmatch(labels[-1]):
+        raise Deny("ip-literal")
+    return host
+
+
+# -----------------------------------------------------------------
+# Addresses
+# -----------------------------------------------------------------
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_IPV4_COMPAT = ipaddress.ip_network("::/96")
+
+
+def embedded_ipv4(ip):
+    """If an IPv6 address carries an IPv4 address (IPv4-mapped, 6to4, NAT64,
+    or the deprecated IPv4-compatible form), return that IPv4 address."""
+    if ip.version == 6:
+        if ip.ipv4_mapped is not None:
+            return ip.ipv4_mapped
+        if ip.sixtofour is not None:
+            return ip.sixtofour
+        if ip in _NAT64 or ip in _IPV4_COMPAT:
+            return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return ip
+
+
+def is_global_address(addr):
+    """True if `addr` is a globally routable unicast address once any
+    embedded IPv4 address has been unwrapped."""
+    try:
+        ip = embedded_ipv4(ipaddress.ip_address(addr))
+    except ValueError:
+        return False
+    return ip.is_global and not ip.is_multicast
+
+
+async def system_resolver(host, port):
+    """Resolve with getaddrinfo; return [(ip, port), ...] without duplicates."""
+    loop = asyncio.get_running_loop()
+    infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM,
+                                   proto=socket.IPPROTO_TCP)
+    out = []
+    for family, _, _, _, sockaddr in infos:
+        if family in (socket.AF_INET, socket.AF_INET6):
+            entry = (sockaddr[0], sockaddr[1])
+            if entry not in out:
+                out.append(entry)
+    return out
+
+
+# -----------------------------------------------------------------
+# Configuration: allowlist and envs.conf
+# -----------------------------------------------------------------
+class Allowlist:
+    """`example.com` matches exactly; `.example.com` matches the apex and
+    every subdomain."""
+
+    def __init__(self, exact=(), suffixes=()):
+        self.exact = set(exact)
+        self.suffixes = set(suffixes)
+
+    def __len__(self):
+        return len(self.exact) + len(self.suffixes)
+
+    def match(self, host):
+        if host in self.exact:
+            return True
+        labels = host.split(".")
+        return any(".".join(labels[i:]) in self.suffixes
+                   for i in range(len(labels)))
+
+    @classmethod
+    def load(cls, directory):
+        """Read every *.list file in `directory` (symlinks are followed).
+        Bad entries are skipped with a warning: they can only narrow policy."""
+        allow = cls()
+        directory = Path(directory)
+        if not directory.is_dir():
+            warn(f"allowlist directory {directory} missing; denying everything")
+            return allow
+        for path in sorted(directory.glob("*.list")):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as e:
+                warn(f"skipping {path}: {e}")
+                continue
+            for lineno, line in enumerate(text.splitlines(), 1):
+                entry = line.split("#", 1)[0].strip()
+                if not entry:
+                    continue
+                wildcard = entry.startswith(".")
+                try:
+                    name = normalize_host(entry[1:] if wildcard else entry)
+                except Deny as d:
+                    warn(f"{path}:{lineno}: ignoring {entry!r} ({d.reason})")
+                    continue
+                (allow.suffixes if wildcard else allow.exact).add(name)
+        return allow
+
+
+_ENV_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+def parse_envs_conf(text, origin="envs.conf"):
+    """Parse envs.conf (see envs.conf.example at the repo root) and return
+    {ip: env name} for every environment that has an `ip=` field.
+
+    Format: one environment per line, a name followed by key=value fields;
+    blank lines and text after '#' are ignored.  Raises ConfigError."""
+    by_ip, names = {}, set()
+    for lineno, line in enumerate(text.splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        where = f"{origin}:{lineno}"
+        name, *fields = line.split()
+        if not _ENV_NAME_RE.fullmatch(name):
+            raise ConfigError(f"{where}: bad environment name {name!r}")
+        if name == "host":
+            raise ConfigError(f"{where}: 'host' is reserved for the host")
+        if name in names:
+            raise ConfigError(f"{where}: duplicate environment {name!r}")
+        names.add(name)
+        kv = {}
+        for field in fields:
+            key, sep, value = field.partition("=")
+            if not sep or not key or not value:
+                raise ConfigError(f"{where}: expected key=value, got {field!r}")
+            if key in kv:
+                raise ConfigError(f"{where}: duplicate key {key!r}")
+            kv[key] = value
+        if "ip" in kv:
+            try:
+                ip = str(ipaddress.ip_address(kv["ip"]))
+            except ValueError:
+                raise ConfigError(f"{where}: bad ip {kv['ip']!r}") from None
+            if ip in by_ip:
+                raise ConfigError(f"{where}: ip {ip} already used by {by_ip[ip]}")
+            by_ip[ip] = name
+    return by_ip
+
+
+def load_envs_conf(path):
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        warn(f"{path} missing; no VM clients will be accepted")
+        return {}
+    except (OSError, UnicodeError) as e:
+        raise ConfigError(f"{path}: {e}") from None
+    return parse_envs_conf(text, str(path))
+
+
+# -----------------------------------------------------------------
+# TLS ClientHello parsing
+# -----------------------------------------------------------------
+class _Buf:
+    """Minimal big-endian reader for TLS structures; raises ValueError on
+    truncation."""
+
+    def __init__(self, data):
+        self.data, self.pos = data, 0
+
+    def take(self, n):
+        if self.pos + n > len(self.data):
+            raise ValueError("truncated")
+        chunk = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return chunk
+
+    def uint(self, n):
+        return int.from_bytes(self.take(n), "big")
+
+    def vec(self, len_bytes):
+        return self.take(self.uint(len_bytes))
+
+    def done(self):
+        return self.pos == len(self.data)
+
+    def end(self):
+        if not self.done():
+            raise ValueError("trailing bytes")
+
+
+def parse_client_hello(body):
+    """Parse a ClientHello handshake body (after the 4-byte handshake header).
+    Return (sni or None, has_ech).  Raise ValueError if malformed, including
+    duplicate extensions or more than one host_name, which a strict server
+    would reject but a lax one might read differently from us."""
+    b = _Buf(body)
+    b.take(2)       # legacy_version
+    b.take(32)      # random
+    b.vec(1)        # legacy_session_id
+    b.vec(2)        # cipher_suites
+    b.vec(1)        # legacy_compression_methods
+    if b.done():
+        return None, False      # no extensions at all
+    exts = _Buf(b.vec(2))
+    b.end()
+    seen, sni, ech = set(), None, False
+    while not exts.done():
+        etype = exts.uint(2)
+        data = exts.vec(2)
+        if etype in seen:
+            raise ValueError(f"duplicate extension {etype:#06x}")
+        seen.add(etype)
+        if etype == EXT_ECH:
+            ech = True
+        elif etype == EXT_SERVER_NAME:
+            outer = _Buf(data)
+            names_buf = _Buf(outer.vec(2))
+            outer.end()
+            names = []
+            while not names_buf.done():
+                name_type = names_buf.uint(1)
+                name = names_buf.vec(2)
+                if name_type == 0:          # host_name
+                    names.append(name)
+            if len(names) != 1:
+                raise ValueError("server_name must hold exactly one host_name")
+            sni = names[0].decode("ascii")
+    return sni, ech
+
+
+async def read_client_hello(reader, timeout=CLIENT_HELLO_TIMEOUT,
+                            limit=CLIENT_HELLO_MAX):
+    """Read TLS records until one complete ClientHello has arrived.  Return
+    (raw bytes to forward, ClientHello body).  Normally this is one record;
+    a ClientHello split across several handshake records is reassembled."""
+    raw, hs = bytearray(), bytearray()
+    try:
+        async with asyncio.timeout(timeout):
+            while True:
+                header = await reader.readexactly(5)
+                raw += header
+                length = int.from_bytes(header[3:5], "big")
+                if (header[0] != TLS_HANDSHAKE or header[1] != 3
+                        or not 0 < length <= 16384):
+                    raise Deny("not-tls", None)
+                if len(hs) + length > limit + 4:
+                    raise Deny("client-hello-too-large", None)
+                body = await reader.readexactly(length)
+                raw += body
+                hs += body
+                if len(hs) >= 4:
+                    if hs[0] != TLS_CLIENT_HELLO:
+                        raise Deny("not-tls", None)
+                    need = 4 + int.from_bytes(hs[1:4], "big")
+                    if need > limit + 4:
+                        raise Deny("client-hello-too-large", None)
+                    if len(hs) >= need:
+                        return bytes(raw), bytes(hs[4:need])
+    except TimeoutError:
+        raise Deny("client-hello-timeout", None) from None
+    except asyncio.IncompleteReadError:
+        raise Deny("not-tls", None) from None
+
+
+# -----------------------------------------------------------------
+# HTTP request head
+# -----------------------------------------------------------------
+_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_CTL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_VERSION_RE = re.compile(r"HTTP/1\.[01]")
+
+
+def parse_head(head):
+    """Parse a request head ending in CRLFCRLF.  Return (method, target,
+    version, [(name, value), ...]).  Raise Deny('bad-request', 400)."""
+    text = head.decode("latin-1")[:-4]
+    lines = text.split("\r\n")
+    if any(_CTL_RE.search(line) for line in lines):
+        raise Deny("bad-request", 400)
+    parts = lines[0].split(" ")
+    if len(parts) != 3 or not _TOKEN_RE.fullmatch(parts[0]) \
+            or not parts[1] or not _VERSION_RE.fullmatch(parts[2]):
+        raise Deny("bad-request", 400)
+    headers = []
+    for line in lines[1:]:
+        name, sep, value = line.partition(":")
+        if not sep or not _TOKEN_RE.fullmatch(name):
+            raise Deny("bad-request", 400)   # also rejects obs-fold lines
+        headers.append((name, value.strip(" \t")))
+    return parts[0], parts[1], parts[2], headers
+
+
+def split_host_port(authority, default_port):
+    """Split "host[:port]".  Bracketed IPv6 is an IP literal."""
+    if authority.startswith("["):
+        raise Deny("ip-literal")
+    host, sep, port = authority.rpartition(":")
+    if not sep:
+        return authority, default_port
+    if port == "" and default_port is not None:
+        return host, default_port
+    if not port.isdigit() or len(port) > 5:
+        raise Deny("bad-request", 400)
+    return host, int(port)
+
+
+# -----------------------------------------------------------------
+# The proxy
+# -----------------------------------------------------------------
+def _clip(value):
+    return value[:LOG_FIELD_MAX] if isinstance(value, str) else value
+
+
+class Proxy:
+    """One instance serves all listeners.
+
+    `resolver` and `address_allowed` are seams for tests: tests map names to
+    127.0.0.1 and must pass `address_allowed` explicitly to accept loopback
+    addresses.  Neither is reachable from the command line."""
+
+    def __init__(self, allowlist_dir=DEFAULT_ALLOWLIST_DIR,
+                 envs_conf=DEFAULT_ENVS_CONF, *, resolver=system_resolver,
+                 address_allowed=is_global_address, log_stream=None,
+                 header_timeout=HEADER_TIMEOUT,
+                 client_hello_timeout=CLIENT_HELLO_TIMEOUT,
+                 idle_timeout=IDLE_TIMEOUT,
+                 max_conns_per_client=MAX_CONNS_PER_CLIENT):
+        self.allowlist_dir = allowlist_dir
+        self.envs_conf = envs_conf
+        self.resolver = resolver
+        self.address_allowed = address_allowed
+        self.log_stream = log_stream
+        self.header_timeout = header_timeout
+        self.client_hello_timeout = client_hello_timeout
+        self.idle_timeout = idle_timeout
+        self.max_conns_per_client = max_conns_per_client
+        self.active = collections.Counter()
+        self.servers = []
+        self.allowlist, self.vm_clients = self._load()
+
+    # --- configuration ---------------------------------------------
+    def _load(self):
+        return Allowlist.load(self.allowlist_dir), load_envs_conf(self.envs_conf)
+
+    def reload(self):
+        """SIGHUP: swap in new configuration; keep the old one on error."""
+        try:
+            self.allowlist, self.vm_clients = self._load()
+        except ConfigError as e:
+            warn(f"reload failed, keeping previous configuration: {e}")
+            return False
+        warn(f"reloaded: {len(self.allowlist)} allowlist entries, "
+             f"{len(self.vm_clients)} VM clients")
+        return True
+
+    def client_env(self, kind, client_ip):
+        """Environment name for a client on a listener of `kind`, or None."""
+        if kind == "host":
+            return "host" if client_ip == "127.0.0.1" else None
+        return self.vm_clients.get(client_ip)
+
+    # --- serving ---------------------------------------------------
+    async def start(self, listeners):
+        """Start serving on [(socket, kind), ...]."""
+        for sock, kind in listeners:
+            server = await asyncio.start_server(
+                lambda r, w, kind=kind: self._handle(r, w, kind),
+                sock=sock, limit=HEADER_MAX)
+            self.servers.append(server)
+        return self.servers
+
+    async def close(self):
+        for server in self.servers:
+            server.close()
+        for server in self.servers:
+            await server.wait_closed()
+
+    def _log(self, rec, started):
+        rec["duration_ms"] = int((time.monotonic() - started) * 1000)
+        line = json.dumps({k: _clip(v) for k, v in rec.items()},
+                          separators=(",", ":"))
+        stream = self.log_stream or sys.stdout
+        try:
+            stream.write(line + "\n")
+            stream.flush()
+        except OSError as e:
+            warn(f"cannot write decision log: {e}")
+
+    async def _handle(self, reader, writer, kind):
+        started = time.monotonic()
+        peer = writer.get_extra_info("peername")
+        client_ip = str(embedded_ipv4(ipaddress.ip_address(peer[0])))
+        rec = {
+            "ts": datetime.datetime.now(datetime.UTC)
+                  .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "env": None, "client": client_ip, "method": None, "host": None,
+            "port": None, "sni": None, "addr": None, "decision": "deny",
+            "reason": None, "bytes_up": 0, "bytes_down": 0, "duration_ms": 0,
+        }
+        rec["env"] = env = self.client_env(kind, client_ip)
+        counted = False
+        try:
+            if env is None:
+                raise Deny("unknown-client", None)
+            if self.active[client_ip] >= self.max_conns_per_client:
+                raise Deny("too-many-connections", 429)
+            self.active[client_ip] += 1
+            counted = True
+            await self._serve(reader, writer, rec)
+        except Deny as d:
+            rec["decision"] = "deny"
+            rec["reason"] = d.reason
+            if d.status is not None:
+                await self._send_error(writer, d.status, d.reason)
+        except (OSError, asyncio.IncompleteReadError) as e:
+            # The client or upstream went away mid-stream.
+            if rec["decision"] == "deny" and rec["reason"] is None:
+                rec["reason"] = "client-closed"
+            elif rec["reason"] is None:
+                rec["reason"] = f"io-error: {e.__class__.__name__}"
+        except Exception as e:      # never let one connection kill the proxy
+            rec["reason"] = f"internal-error: {e.__class__.__name__}"
+            warn(f"internal error for {client_ip}: {e!r}")
+        finally:
+            if counted:
+                self.active[client_ip] -= 1
+                if not self.active[client_ip]:
+                    del self.active[client_ip]
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+            self._log(rec, started)
+
+    async def _send_error(self, writer, status, reason):
+        body = f"agent-egress-proxy: {reason}\n".encode()
+        head = (f"HTTP/1.1 {status} {STATUS_TEXT.get(status, 'Error')}\r\n"
+                "Content-Type: text/plain\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n")
+        if status == 405:
+            head += "Allow: CONNECT, GET, HEAD\r\n"
+        try:
+            writer.write(head.encode() + b"\r\n" + body)
+            await writer.drain()
+        except OSError:
+            pass
+
+    async def _serve(self, reader, writer, rec):
+        try:
+            async with asyncio.timeout(self.header_timeout):
+                head = await reader.readuntil(b"\r\n\r\n")
+        except TimeoutError:
+            raise Deny("header-timeout", 408) from None
+        except asyncio.LimitOverrunError:
+            raise Deny("header-too-large", 431) from None
+        except asyncio.IncompleteReadError:
+            raise Deny("client-closed", None) from None
+        method, target, version, headers = parse_head(head)
+        rec["method"] = method
+        if method == "CONNECT":
+            await self._connect(reader, writer, target, rec)
+        elif method in ("GET", "HEAD"):
+            await self._http(writer, method, target, version, headers, rec)
+        else:
+            raise Deny("bad-method", 405)
+
+    # --- policy ----------------------------------------------------
+    def _check_policy(self, host, port, allowed_port):
+        if not self.allowlist.match(host):
+            raise Deny("not-allowlisted")
+        if port != allowed_port:
+            raise Deny("bad-port")
+
+    async def _resolve(self, host, port, rec):
+        """Resolve and vet every address; return [(ip, port), ...]."""
+        try:
+            async with asyncio.timeout(RESOLVE_TIMEOUT):
+                addrs = await self.resolver(host, port)
+        except (OSError, TimeoutError, UnicodeError):
+            raise Deny("resolve-failed", 502) from None
+        if not addrs:
+            raise Deny("resolve-failed", 502)
+        for ip, _ in addrs:
+            if not self.address_allowed(ip):
+                rec["addr"] = ip
+                raise Deny("non-global-address")
+        return addrs
+
+    async def _open_upstream(self, addrs, rec, status):
+        """Connect to the first reachable pinned address (never the name)."""
+        for ip, port in addrs:
+            try:
+                async with asyncio.timeout(UPSTREAM_CONNECT_TIMEOUT):
+                    up = await asyncio.open_connection(
+                        ip, port, flags=socket.AI_NUMERICHOST)
+            except (OSError, TimeoutError):
+                continue
+            rec["addr"] = ip
+            return up
+        raise Deny("upstream-connect-failed", status)
+
+    # --- CONNECT ---------------------------------------------------
+    async def _connect(self, reader, writer, target, rec):
+        host_raw, port = split_host_port(target, None)
+        rec["host"], rec["port"] = host_raw, port
+        if port is None:
+            raise Deny("bad-request", 400)
+        host = rec["host"] = normalize_host(host_raw)
+        self._check_policy(host, port, CONNECT_PORT)
+        addrs = await self._resolve(host, port, rec)
+
+        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await writer.drain()
+
+        # From here on failures close the connection without a response.
+        raw, body = await read_client_hello(reader, self.client_hello_timeout)
+        try:
+            sni, ech = parse_client_hello(body)
+        except ValueError:
+            raise Deny("not-tls", None) from None
+        rec["sni"] = sni
+        if ech:
+            raise Deny("ech", None)
+        if sni is None:
+            raise Deny("sni-missing", None)
+        try:
+            sni_norm = normalize_host(sni)
+        except Deny:
+            raise Deny("sni-mismatch", None) from None
+        if sni_norm != host:
+            raise Deny("sni-mismatch", None)
+
+        up_reader, up_writer = await self._open_upstream(addrs, rec, None)
+        rec["decision"] = "allow"
+        try:
+            up_writer.write(raw)
+            rec["bytes_up"] += len(raw)
+            await self._pipe([(reader, up_writer, "bytes_up"),
+                              (up_reader, writer, "bytes_down")], rec)
+        finally:
+            up_writer.close()
+
+    # --- plain HTTP ------------------------------------------------
+    async def _http(self, writer, method, target, version, headers, rec):
+        scheme, sep, rest = target.partition("://")
+        if not sep or scheme.lower() != "http":
+            raise Deny("bad-request", 400)
+        authority = re.match(r"[^/?#]*", rest).group(0)
+        path = rest[len(authority):].split("#", 1)[0]
+        if not path.startswith("/"):
+            path = "/" + path
+        rec["host"] = authority.rpartition("@")[2]     # never log credentials
+        if "@" in authority:
+            raise Deny("userinfo")
+        host_raw, port = split_host_port(authority, HTTP_PORT)
+        rec["port"] = port
+        host = rec["host"] = normalize_host(host_raw)
+        self._check_policy(host, port, HTTP_PORT)
+
+        # Only bodiless GET/HEAD are forwarded, so a body cannot be smuggled.
+        names = {n.lower() for n, _ in headers}
+        if "transfer-encoding" in names or any(
+                n.lower() == "content-length" and v != "0" for n, v in headers):
+            raise Deny("request-body", 400)
+        hop = {"connection", "keep-alive", "te", "trailer", "upgrade",
+               "host", "content-length"}
+        for n, v in headers:
+            if n.lower() == "connection":
+                hop |= {t.strip().lower() for t in v.split(",")}
+        kept = [f"{n}: {v}" for n, v in headers
+                if n.lower() not in hop and not n.lower().startswith("proxy-")]
+        request = "\r\n".join([f"{method} {path} {version}", f"Host: {host}",
+                               *kept, "Connection: close", "", ""])
+
+        addrs = await self._resolve(host, port, rec)
+        up_reader, up_writer = await self._open_upstream(addrs, rec, 502)
+        rec["decision"] = "allow"
+        try:
+            data = request.encode("latin-1")
+            up_writer.write(data)
+            rec["bytes_up"] += len(data)
+            await self._pipe([(up_reader, writer, "bytes_down")], rec)
+        finally:
+            up_writer.close()
+
+    # --- relaying --------------------------------------------------
+    async def _pipe(self, pairs, rec):
+        """Copy each (reader → writer) until EOF, closing everything after
+        `idle_timeout` seconds without traffic in any direction."""
+        loop = asyncio.get_running_loop()
+        last = [loop.time()]
+
+        async def copy(src, dst, key):
+            while data := await src.read(65536):
+                dst.write(data)
+                rec[key] += len(data)
+                last[0] = loop.time()
+                await dst.drain()
+            if dst.can_write_eof():
+                try:
+                    dst.write_eof()     # pass the half-close along
+                except OSError:
+                    pass
+
+        tasks = {asyncio.create_task(copy(*p)) for p in pairs}
+        try:
+            while tasks:
+                remaining = last[0] + self.idle_timeout - loop.time()
+                if remaining <= 0:
+                    rec["reason"] = "idle-timeout"
+                    break
+                done, tasks = await asyncio.wait(
+                    tasks, timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    if t.exception() is not None:
+                        rec["reason"] = f"io-error: {t.exception().__class__.__name__}"
+                        return
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# -----------------------------------------------------------------
+# Listeners
+# -----------------------------------------------------------------
+def sockets_from_systemd(environ=None):
+    """Return listening sockets passed by systemd (sd_listen_fds protocol):
+    fds 3 .. 3+LISTEN_FDS-1, valid only if LISTEN_PID is our PID.  The
+    variables are removed so they are not inherited."""
+    environ = os.environ if environ is None else environ
+    try:
+        if int(environ.get("LISTEN_PID", "")) != os.getpid():
+            return []
+        count = int(environ.get("LISTEN_FDS", ""))
+    except ValueError:
+        return []
+    finally:
+        for key in ("LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"):
+            environ.pop(key, None)
+    socks = []
+    for fd in range(3, 3 + count):
+        sock = socket.socket(fileno=fd)
+        if sock.type != socket.SOCK_STREAM or \
+                sock.family not in (socket.AF_INET, socket.AF_INET6):
+            raise ConfigError(f"fd {fd} is not a TCP socket")
+        socks.append(sock)
+    return socks
+
+
+def listener_kind(sock):
+    """Loopback listeners serve the host; all others serve VMs."""
+    ip = embedded_ipv4(ipaddress.ip_address(sock.getsockname()[0]))
+    return "host" if ip.is_loopback else "vm"
+
+
+def listen_socket(spec):
+    """--listen ADDR:PORT[=host|vm] → (socket, kind)."""
+    addr_port, _, kind = spec.partition("=")
+    if kind not in ("", "host", "vm"):
+        raise ConfigError(f"--listen {spec}: kind must be host or vm")
+    host, sep, port = addr_port.rpartition(":")
+    host = host.strip("[]")
+    if not sep or not port.isdigit():
+        raise ConfigError(f"--listen {spec}: expected ADDR:PORT")
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, int(port)))
+    sock.listen(128)
+    return sock, kind or listener_kind(sock)
+
+
+async def run(proxy, listeners):
+    await proxy.start(listeners)
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    loop.add_signal_handler(signal.SIGHUP, proxy.reload)
+    loop.add_signal_handler(signal.SIGTERM, stop.set)
+    loop.add_signal_handler(signal.SIGINT, stop.set)
+    for sock, kind in listeners:
+        name = sock.getsockname()
+        warn(f"listening on {name[0]}:{name[1]} ({kind}); "
+             f"{len(proxy.allowlist)} allowlist entries, "
+             f"{len(proxy.vm_clients)} VM clients")
+    await stop.wait()
+    await proxy.close()
+
+
+def main(argv=None):
+    # A reload that arrives before the asyncio handler is installed must not
+    # kill the process (SIGHUP's default action).
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    parser = argparse.ArgumentParser(
+        description="Allowlisting HTTP CONNECT/GET proxy for coding agents.")
+    parser.add_argument("--allowlist-dir", default=DEFAULT_ALLOWLIST_DIR)
+    parser.add_argument("--envs-conf", default=DEFAULT_ENVS_CONF)
+    parser.add_argument("--listen", action="append", default=[],
+                        metavar="ADDR:PORT[=host|vm]",
+                        help="listen here in addition to any sockets passed "
+                             "by systemd; kind defaults to host for loopback "
+                             "addresses and vm otherwise")
+    args = parser.parse_args(argv)
+    try:
+        listeners = [(s, listener_kind(s)) for s in sockets_from_systemd()]
+        listeners += [listen_socket(spec) for spec in args.listen]
+        proxy = Proxy(args.allowlist_dir, args.envs_conf)
+    except (ConfigError, OSError) as e:
+        warn(str(e))
+        return 1
+    if not listeners:
+        warn("no listening sockets: use socket activation or --listen")
+        return 2
+    asyncio.run(run(proxy, listeners))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

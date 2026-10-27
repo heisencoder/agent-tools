@@ -1,0 +1,4 @@
+# npm registry.  Cloudflare-fronted: the SNI check stops TLS-level fronting,
+# but Host-header fronting inside TLS remains possible.  Prefer a local
+# mirror (e.g. verdaccio) and keep this profile disabled when that matters.
+registry.npmjs.org

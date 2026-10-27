@@ -1,0 +1,69 @@
+name: Test agent-egress, agent-audit, agent-logs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'agent-egress/**'
+      - 'agent-audit/**'
+      - 'agent-logs/**'
+      - 'envs.conf.example'
+      - '.github/workflows/agent-tools-test.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'agent-egress/**'
+      - 'agent-audit/**'
+      - 'agent-logs/**'
+      - 'envs.conf.example'
+      - '.github/workflows/agent-tools-test.yml'
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported version and the python3 of Ubuntu 26.04.
+        python: ['3.12', '3.14']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: agent-egress unit tests
+        run: python -m unittest discover -s agent-egress/tests -v
+
+      - name: agent-audit unit tests
+        run: python -m unittest discover -s agent-audit/tests -v
+
+      - name: agent-logs unit tests
+        run: python -m unittest discover -s agent-logs/tests -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install nftables
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nftables
+
+      - name: shellcheck
+        run: |
+          # Every shell script in the three components, found by shebang.
+          grep -rlE '^#!.*\b(ba)?sh\b' agent-egress agent-audit agent-logs \
+            | xargs shellcheck --external-sources
+
+      - name: Validate JSON
+        run: |
+          for f in $(find agent-egress agent-audit agent-logs -name '*.json' -o -name '*.json.in'); do
+            sed -e 's/@[A-Z_]*@/placeholder/g' "$f" | jq empty || { echo "invalid JSON: $f"; exit 1; }
+          done
+
+      - name: nftables syntax check
+        run: sudo agent-egress/tests/check-nft.sh
